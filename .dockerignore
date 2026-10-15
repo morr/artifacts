@@ -1,5 +1,8 @@
 target
 data
 .git
+vendor
+skills
 mcp/node_modules
 mcp/dist
+
