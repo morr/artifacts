@@ -9,6 +9,7 @@
 //!   versions/
 //!     2026-10-09T18-22-33-123Z       # previous content
 //!     2026-10-09T18-22-33-123Z.json  # its meta at the time of saving
+//! aliases/<old-name> # renamed away: file content is the new name
 //! ```
 //!
 //! All writes are atomic (tmp file + rename). Artifact names are strictly
@@ -69,6 +70,13 @@ pub enum PutOutcome {
     Unchanged,
 }
 
+#[derive(Debug, PartialEq)]
+pub enum RenameOutcome {
+    Renamed(Meta),
+    SourceMissing,
+    TargetExists,
+}
+
 fn now_rfc3339() -> String {
     OffsetDateTime::now_utc().format(&Rfc3339).unwrap_or_default()
 }
@@ -92,11 +100,20 @@ impl FileStore {
     pub fn new(root: impl Into<PathBuf>) -> io::Result<Self> {
         let store = FileStore { root: root.into() };
         fs::create_dir_all(store.artifacts_root())?;
+        fs::create_dir_all(store.aliases_dir())?;
         Ok(store)
     }
 
     fn artifacts_root(&self) -> PathBuf {
         self.root.join("artifacts")
+    }
+
+    fn aliases_dir(&self) -> PathBuf {
+        self.root.join("aliases")
+    }
+
+    fn alias_path(&self, name: &str) -> PathBuf {
+        self.aliases_dir().join(name)
     }
 
     fn artifact_dir(&self, name: &str) -> PathBuf {
@@ -116,12 +133,36 @@ impl FileStore {
         Ok(serde_json::from_slice(&raw)?)
     }
 
+    /// The name an old public URL should redirect to, if any: `name` was
+    /// renamed away and no artifact lives under it anymore.
+    pub fn resolve_alias(&self, name: &str) -> io::Result<Option<String>> {
+        match fs::read_to_string(self.alias_path(name)) {
+            Ok(target) => {
+                let target = target.trim();
+                Ok(valid_name(target).then(|| target.to_string()))
+            }
+            Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(None),
+            Err(e) => Err(e),
+        }
+    }
+
+    fn set_alias(&self, from: &str, to: &str) -> io::Result<()> {
+        atomic_write(&self.alias_path(from), to.as_bytes())
+    }
+
+    fn remove_alias(&self, name: &str) {
+        // best-effort: a missing alias file is not an error
+        let _ = fs::remove_file(self.alias_path(name));
+    }
+
     /// Create or update an artifact. Updating moves the previous `current`
-    /// into `versions/`; identical content+type is a no-op.
+    /// into `versions/`; identical content+type is a no-op. Creating under a
+    /// name that used to redirect drops the redirect.
     pub fn put(&self, name: &str, content: &[u8], content_type: &str) -> io::Result<PutOutcome> {
         let dir = self.artifact_dir(name);
         if !self.exists(name) {
             fs::create_dir_all(&dir)?;
+            self.remove_alias(name);
             let meta = Meta {
                 content_type: content_type.to_string(),
                 created_at: now_rfc3339(),
@@ -249,6 +290,38 @@ impl FileStore {
         Ok(Some(meta))
     }
 
+    /// Move an artifact to a new name: one atomic directory rename, so the
+    /// content, history and timestamps come along unchanged. Renaming to the
+    /// same name is a no-op. The old name keeps redirecting to the new one
+    /// while the artifact lives there.
+    pub fn rename(&self, from: &str, to: &str) -> io::Result<RenameOutcome> {
+        if !self.exists(from) {
+            return Ok(RenameOutcome::SourceMissing);
+        }
+        if from == to {
+            return Ok(RenameOutcome::Renamed(self.read_meta(from)?));
+        }
+        if self.exists(to) {
+            return Ok(RenameOutcome::TargetExists);
+        }
+        fs::rename(self.artifact_dir(from), self.artifact_dir(to))?;
+        // The artifact itself now lives under `to`, so its stale alias goes;
+        // aliases pointing at `from` follow the artifact to `to`; and `from`
+        // starts redirecting.
+        self.remove_alias(to);
+        let aliases = self.aliases_dir();
+        if aliases.is_dir() {
+            for entry in fs::read_dir(&aliases)? {
+                let path = entry?.path();
+                if fs::read_to_string(&path).map(|t| t.trim() == from).unwrap_or(false) {
+                    atomic_write(&path, to.as_bytes())?;
+                }
+            }
+        }
+        self.set_alias(from, to)?;
+        Ok(RenameOutcome::Renamed(self.read_meta(to)?))
+    }
+
     pub fn delete(&self, name: &str) -> io::Result<bool> {
         if !self.exists(name) {
             return Ok(false);
@@ -358,6 +431,58 @@ mod tests {
     }
 
     #[test]
+    fn rename_keeps_content_history_and_timestamps() {
+        let (_dir, s) = store();
+        s.put("demo", b"v1", "text/html").unwrap();
+        s.put("demo", b"v2", "text/html").unwrap();
+        s.put("taken", b"x", "text/plain").unwrap();
+        let (_, created_at) = s.get_current("demo").unwrap().unwrap();
+        let created_at = created_at.created_at;
+
+        assert_eq!(s.rename("demo", "taken").unwrap(), RenameOutcome::TargetExists);
+        assert!(s.exists("demo"));
+        assert_eq!(s.rename("nope", "fresh").unwrap(), RenameOutcome::SourceMissing);
+        // renaming to the same name is a no-op
+        assert!(matches!(s.rename("demo", "demo").unwrap(), RenameOutcome::Renamed(_)));
+
+        assert!(matches!(
+            s.rename("demo", "renamed").unwrap(),
+            RenameOutcome::Renamed(_)
+        ));
+        assert!(!s.exists("demo"));
+        let (content, meta) = s.get_current("renamed").unwrap().unwrap();
+        assert_eq!(content, b"v2");
+        assert_eq!(meta.created_at, created_at);
+        let (_, versions) = s.get_meta("renamed").unwrap().unwrap();
+        assert_eq!(versions.len(), 1);
+        assert_eq!(versions[0].sha256, sha256_hex(b"v1"));
+    }
+
+    #[test]
+    fn rename_leaves_a_followable_redirect() {
+        let (_dir, s) = store();
+        s.put("a", b"v1", "text/html").unwrap();
+        s.rename("a", "b").unwrap();
+        assert_eq!(s.resolve_alias("a").unwrap().as_deref(), Some("b"));
+        assert_eq!(s.resolve_alias("b").unwrap(), None);
+        assert_eq!(s.resolve_alias("nope").unwrap(), None);
+
+        // aliases pointing at the old name follow the artifact along
+        s.rename("b", "c").unwrap();
+        assert_eq!(s.resolve_alias("a").unwrap().as_deref(), Some("c"));
+        assert_eq!(s.resolve_alias("b").unwrap().as_deref(), Some("c"));
+
+        // renaming back consumes the alias sitting on the target name
+        s.rename("c", "a").unwrap();
+        assert_eq!(s.resolve_alias("a").unwrap(), None);
+        assert_eq!(s.resolve_alias("c").unwrap().as_deref(), Some("a"));
+
+        // recreating a name replaces its redirect with the artifact
+        s.put("c", b"reincarnated", "text/html").unwrap();
+        assert_eq!(s.resolve_alias("c").unwrap(), None);
+    }
+
+    #[test]
     fn list_with_prefix_and_delete() {
         let (_dir, s) = store();
         s.put("report-a", b"1", "text/plain").unwrap();
@@ -382,5 +507,6 @@ mod tests {
         assert!(s.get_current("nope").unwrap().is_none());
         assert!(s.get_meta("nope").unwrap().is_none());
         assert!(s.rollback("nope", "x").unwrap().is_none());
+        assert_eq!(s.rename("nope", "x").unwrap(), RenameOutcome::SourceMissing);
     }
 }

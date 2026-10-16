@@ -2,7 +2,7 @@
 /**
  * MCP server for the artifacts storage (https://github.com/morr/artifacts).
  *
- * Tools: list/get/save/update artifacts, list versions, rollback, delete.
+ * Tools: list/get/save/update artifacts, list versions, rollback, rename, delete.
  * Reads ARTIFACTS_BASE_URL and ARTIFACTS_TOKEN from the environment;
  * all tool failures come back as isError results with a readable message.
  */
@@ -251,6 +251,29 @@ server.registerTool(
     const resp = await api(`/api/artifacts/${name}/rollback/${version}`, { ...c, method: "POST" });
     const meta = (await resp.json()) as MetaRow;
     return { content: [{ type: "text", text: JSON.stringify({ name, rolledBackTo: version, meta }, null, 2) }] };
+  },
+);
+
+server.registerTool(
+  "rename_artifact",
+  {
+    title: "Rename artifact",
+    description:
+      "Rename an artifact: the public URL changes to the new name; the old URL keeps answering " +
+      "with a redirect to it (until something is created under the old name). " +
+      "Content, version history and timestamps are preserved; fails if the new name already exists.",
+    inputSchema: {
+      name: z.string().describe(`Current artifact name, ${NAME_RULE}`),
+      newName: z.string().describe(`New artifact name, ${NAME_RULE}`),
+    },
+  },
+  async ({ name, newName }) => {
+    const c = config();
+    assertName(name);
+    assertName(newName);
+    const resp = await api(`/api/artifacts/${name}/rename/${newName}`, { ...c, method: "POST" });
+    const result = (await resp.json()) as { old_name: string; name: string; url: string };
+    return { content: [{ type: "text", text: JSON.stringify(result, null, 2) }] };
   },
 );
 
