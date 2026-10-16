@@ -5,8 +5,10 @@ files on its own filesystem, plus an MCP server for AI agents to work with them.
 
 - **Public** (no auth): `GET /a/<name>` — serves the current version of an
   artifact with its stored content type (HTML renders in a browser); `GET /healthz`.
+  A renamed artifact keeps answering on its old URL with a 302 redirect to the
+  new name, as long as nothing was created under the old name since.
 - **Everything else** requires `Authorization: Bearer $ARTIFACTS_TOKEN`:
-  list, metadata, versions, upload/update, rollback, delete. There is no public
+  list, metadata, versions, upload/update, rollback, rename, delete. There is no public
   listing and never will be — artifact names are only visible with the token.
 - Updates archive the previous version (`versions/<timestamp>`), so anything can
   be rolled back.
@@ -24,6 +26,7 @@ Artifact names must match `^[a-z0-9][a-z0-9-]{0,63}$` — one safe path componen
 | PUT | `/api/artifacts/{name}` | body = content; `X-Create-Only: true` → 409 if exists; `X-Update-Only: true` → 404 if missing; otherwise upsert. Content type taken from the request `Content-Type` |
 | GET | `/api/artifacts/{name}/versions/{version}` | download a specific version |
 | POST | `/api/artifacts/{name}/rollback/{version}` | make a version current (outgoing current is archived) |
+| POST | `/api/artifacts/{name}/rename/{new}` | atomic move; 409 if the target name exists; content, history and timestamps are preserved; the old URL answers with a 302 redirect (aliases follow further renames; recreating a name drops its redirect) |
 | DELETE | `/api/artifacts/{name}` | remove the artifact with all versions |
 
 ## Configuration (env)
@@ -44,6 +47,7 @@ Artifact names must match `^[a-z0-9][a-z0-9-]{0,63}$` — one safe path componen
   meta.json            # content_type, created_at, updated_at, size, sha256
   versions/2026-10-09T18-22-33-123Z       # archived content
   versions/2026-10-09T18-22-33-123Z.json  # its meta at save time
+<data>/aliases/<old-name>  # renamed artifact: file content is the new name
 ```
 
 All writes are atomic (tmp + rename).
@@ -52,7 +56,7 @@ All writes are atomic (tmp + rename).
 
 TypeScript MCP server over stdio with tools `list_artifacts`, `get_artifact`,
 `save_artifact` (create-only), `update_artifact` (update-only), `list_versions`,
-`rollback_artifact`, `delete_artifact`. Responses include the public URL
+`rollback_artifact`, `rename_artifact`, `delete_artifact`. Responses include the public URL
 (`/a/<name>`) so an agent can hand the link straight to the user.
 
 ```sh
@@ -73,8 +77,18 @@ ARTIFACTS_TOKEN=dev PORT=8080 ARTIFACTS_DATA_DIR=./data ./target/release/artifac
 
 ## Deploy
 
-Deployed with kamal from the separate repo `~/develop/work/minisklad-artifacts`
-(image `morr507/artifacts` on Docker Hub). TLS terminates at kamal-proxy.
+The deploy repo is a separate checkout: `~/develop/work/minisklad-artifacts` —
+kamal config plus the `./deploy` wrapper (image `morr507/artifacts` on Docker
+Hub; TLS terminates at kamal-proxy; data on the host at
+`/home/devops/artifacts/data`):
+
+```sh
+cd ~/develop/work/minisklad-artifacts && ./deploy
+```
+
+The build context is this repo (`../artifacts` relative to the deploy repo), so
+uncommitted changes here ship as-is — no commit needed first. The image is
+built remotely on the target server (native amd64, no qemu emulation).
 
 ## Tests
 
