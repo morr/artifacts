@@ -9,6 +9,7 @@
 //!   versions/
 //!     2026-10-09T18-22-33-123Z       # previous content
 //!     2026-10-09T18-22-33-123Z.json  # its meta at the time of saving
+//! images/<name>/     # same structure, image namespace (no rename, no aliases)
 //! aliases/<old-name> # renamed away: file content is the new name
 //! ```
 //!
@@ -94,22 +95,36 @@ fn atomic_write(path: &std::path::Path, data: &[u8]) -> io::Result<()> {
 #[derive(Clone)]
 pub struct FileStore {
     root: PathBuf,
+    /// Namespace directory under the root: `artifacts` or `images`.
+    collection: &'static str,
+    /// Aliases directory under the root; images have no rename, hence none.
+    aliases: &'static str,
 }
 
 impl FileStore {
+    /// The artifact store: `<root>/artifacts/<name>`, renames tracked in
+    /// `<root>/aliases`.
     pub fn new(root: impl Into<PathBuf>) -> io::Result<Self> {
-        let store = FileStore { root: root.into() };
-        fs::create_dir_all(store.artifacts_root())?;
+        let store = FileStore { root: root.into(), collection: "artifacts", aliases: "aliases" };
+        fs::create_dir_all(store.collection_root())?;
         fs::create_dir_all(store.aliases_dir())?;
         Ok(store)
     }
 
-    fn artifacts_root(&self) -> PathBuf {
-        self.root.join("artifacts")
+    /// The image store shares the data dir but keeps its own namespace,
+    /// `<root>/images/<name>`; there is no rename for images, hence no aliases.
+    pub fn image_store(root: impl Into<PathBuf>) -> io::Result<Self> {
+        let store = FileStore { root: root.into(), collection: "images", aliases: "image-aliases" };
+        fs::create_dir_all(store.collection_root())?;
+        Ok(store)
+    }
+
+    fn collection_root(&self) -> PathBuf {
+        self.root.join(self.collection)
     }
 
     fn aliases_dir(&self) -> PathBuf {
-        self.root.join("aliases")
+        self.root.join(self.aliases)
     }
 
     fn alias_path(&self, name: &str) -> PathBuf {
@@ -117,7 +132,7 @@ impl FileStore {
     }
 
     fn artifact_dir(&self, name: &str) -> PathBuf {
-        self.artifacts_root().join(name)
+        self.collection_root().join(name)
     }
 
     fn versions_dir(&self, name: &str) -> PathBuf {
@@ -332,7 +347,7 @@ impl FileStore {
 
     pub fn list(&self, prefix: &str) -> io::Result<Vec<ListItem>> {
         let mut items = Vec::new();
-        for entry in fs::read_dir(self.artifacts_root())? {
+        for entry in fs::read_dir(self.collection_root())? {
             let path = entry?.path();
             let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
                 continue;
@@ -508,5 +523,29 @@ mod tests {
         assert!(s.get_meta("nope").unwrap().is_none());
         assert!(s.rollback("nope", "x").unwrap().is_none());
         assert_eq!(s.rename("nope", "x").unwrap(), RenameOutcome::SourceMissing);
+    }
+
+    #[test]
+    fn image_store_is_a_separate_namespace() {
+        let (dir, s) = store();
+        let images = FileStore::image_store(dir.path()).unwrap();
+        s.put("x-dup", b"page", "text/html").unwrap();
+        images.put("x-dup", b"png-bytes", "image/png").unwrap();
+
+        let (content, meta) = images.get_current("x-dup").unwrap().unwrap();
+        assert_eq!(content, b"png-bytes");
+        assert_eq!(meta.content_type, "image/png");
+        let (content, meta) = s.get_current("x-dup").unwrap().unwrap();
+        assert_eq!(content, b"page");
+        assert_eq!(meta.content_type, "text/html");
+
+        // each namespace lists only its own entries
+        assert_eq!(s.list("").unwrap().len(), 1);
+        assert_eq!(images.list("").unwrap().len(), 1);
+
+        // deleting an image never touches the artifact under the same name
+        assert!(images.delete("x-dup").unwrap());
+        assert!(!images.exists("x-dup"));
+        assert!(s.exists("x-dup"));
     }
 }

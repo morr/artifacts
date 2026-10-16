@@ -30,8 +30,18 @@ async fn main() {
         eprintln!("cannot create data dir {data_dir}: {e}");
         std::process::exit(2);
     });
+    let images = store::FileStore::image_store(&data_dir).unwrap_or_else(|e| {
+        eprintln!("cannot create image dir under {data_dir}: {e}");
+        std::process::exit(2);
+    });
 
-    let state = Arc::new(AppState { store, token: token.into_bytes(), public_base });
+    let state = Arc::new(AppState {
+        store,
+        images,
+        token: token.into_bytes(),
+        public_base,
+        events: tokio::sync::broadcast::channel(256).0,
+    });
 
     let app = api::router(state, max_body);
     let listener = tokio::net::TcpListener::bind(("0.0.0.0", port))
