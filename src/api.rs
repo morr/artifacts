@@ -14,7 +14,7 @@ use axum::{Json, Router};
 use serde::Deserialize;
 use subtle::ConstantTimeEq;
 
-use crate::store::{FileStore, PutOutcome, NAME_RULE};
+use crate::store::{FileStore, PutOutcome, RenameOutcome, NAME_RULE};
 
 pub struct AppState {
     pub store: FileStore,
@@ -32,6 +32,7 @@ pub fn router(state: SharedState, max_body: usize) -> Router {
         .route("/api/artifacts/{name}", get(get_meta).put(put_artifact).delete(delete_artifact))
         .route("/api/artifacts/{name}/versions/{version}", get(get_version))
         .route("/api/artifacts/{name}/rollback/{version}", post(rollback))
+        .route("/api/artifacts/{name}/rename/{new_name}", post(rename_artifact))
         .fallback(not_found)
         .layer(axum::extract::DefaultBodyLimit::max(max_body))
         .with_state(state)
@@ -90,16 +91,34 @@ fn bad_version(version: &str) -> Option<Response> {
 // --- public routes ---
 
 async fn get_public(State(state): State<SharedState>, Path(name): Path<String>) -> Response {
-    if crate::store::valid_name(&name) {
-        match state.store.get_current(&name) {
-            Ok(Some((content, meta))) => build_content_response(content, &meta.content_type),
-            Ok(None) => not_found().await,
-            Err(e) => storage_error(e),
-        }
-    } else {
+    if !crate::store::valid_name(&name) {
         // Invalid names are indistinguishable from missing ones to the public.
-        not_found().await
+        return not_found().await;
     }
+    match state.store.get_current(&name) {
+        Ok(Some((content, meta))) => build_content_response(content, &meta.content_type),
+        Ok(None) => match state.store.resolve_alias(&name) {
+            // The artifact was renamed away: the old URL redirects while the
+            // artifact still exists under the new name.
+            Ok(Some(target)) if state.store.exists(&target) => redirect_response(&state, &target),
+            _ => not_found().await,
+        },
+        Err(e) => storage_error(e),
+    }
+}
+
+/// 302, not 301: names can be reused (delete + create), and a cached
+/// permanent redirect would then serve the wrong artifact.
+fn redirect_response(state: &SharedState, target: &str) -> Response {
+    Response::builder()
+        .status(StatusCode::FOUND)
+        .header(
+            header::LOCATION,
+            format!("{}/a/{}", state.public_base.trim_end_matches('/'), target),
+        )
+        .header(header::CACHE_CONTROL, HeaderValue::from_static("no-cache"))
+        .body(Body::empty())
+        .unwrap()
 }
 
 fn build_content_response(content: Vec<u8>, content_type: &str) -> Response {
@@ -249,6 +268,33 @@ async fn rollback(
     }
 }
 
+async fn rename_artifact(
+    State(state): State<SharedState>,
+    _auth: Authed,
+    Path((name, new_name)): Path<(String, String)>,
+) -> Response {
+    if let Some(resp) = bad_name(&name) {
+        return resp;
+    }
+    if let Some(resp) = bad_name(&new_name) {
+        return resp;
+    }
+    match state.store.rename(&name, &new_name) {
+        Ok(RenameOutcome::Renamed(_)) => (
+            StatusCode::OK,
+            Json(serde_json::json!({
+                "old_name": name,
+                "name": new_name,
+                "url": format!("{}/a/{}", state.public_base.trim_end_matches('/'), new_name),
+            })),
+        )
+            .into_response(),
+        Ok(RenameOutcome::SourceMissing) => error_response(StatusCode::NOT_FOUND, "artifact not found"),
+        Ok(RenameOutcome::TargetExists) => error_response(StatusCode::CONFLICT, "target name already exists"),
+        Err(e) => storage_error(e),
+    }
+}
+
 async fn delete_artifact(State(state): State<SharedState>, _auth: Authed, Path(name): Path<String>) -> Response {
     if let Some(resp) = bad_name(&name) {
         return resp;
@@ -265,6 +311,7 @@ mod tests {
     use super::*;
     use axum::http::Request;
     use http_body_util::BodyExt;
+    use sha2::Digest;
     use tower::ServiceExt;
 
     fn test_state(dir: &std::path::Path) -> SharedState {
@@ -306,6 +353,7 @@ mod tests {
             (axum::http::Method::GET, "/api/artifacts"),
             (axum::http::Method::GET, "/api/artifacts/x-report"),
             (axum::http::Method::PUT, "/api/artifacts/x-report"),
+            (axum::http::Method::POST, "/api/artifacts/x-report/rename/x-new"),
             (axum::http::Method::DELETE, "/api/artifacts/x-report"),
         ] {
             let req = Request::builder().method(method).uri(path).body(Body::empty()).unwrap();
@@ -404,6 +452,133 @@ mod tests {
         let (status, _, _) = send(&app, Request::get("/").body(Body::empty()).unwrap()).await;
         assert_eq!(status, StatusCode::NOT_FOUND);
         let (status, _, _) = send(&app, Request::get("/api").body(Body::empty()).unwrap()).await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn rename_moves_content_and_history() {
+        let dir = tempfile::tempdir().unwrap();
+        let app = router(test_state(dir.path()), 10 * 1024 * 1024);
+
+        let (status, _, _) = send(&app, auth_put("x-old", "<h1>one</h1>", &[])).await;
+        assert_eq!(status, StatusCode::CREATED);
+        let (status, _, _) = send(&app, auth_put("x-old", "<h1>two</h1>", &[])).await;
+        assert_eq!(status, StatusCode::OK);
+        let (status, _, _) = send(&app, auth_put("x-taken", "x", &[])).await;
+        assert_eq!(status, StatusCode::CREATED);
+
+        // target name already taken
+        let (status, body, _) = send(
+            &app,
+            Request::post("/api/artifacts/x-old/rename/x-taken")
+                .header(header::AUTHORIZATION, "Bearer secret-token")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CONFLICT, "{}", String::from_utf8_lossy(&body));
+
+        // missing source
+        let (status, _, _) = send(
+            &app,
+            Request::post("/api/artifacts/x-nope/rename/x-new")
+                .header(header::AUTHORIZATION, "Bearer secret-token")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+
+        // invalid target name
+        let (status, _, _) = send(
+            &app,
+            Request::post("/api/artifacts/x-old/rename/Bad_Name")
+                .header(header::AUTHORIZATION, "Bearer secret-token")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+
+        // the rename itself
+        let (status, body, _) = send(
+            &app,
+            Request::post("/api/artifacts/x-old/rename/x-new")
+                .header(header::AUTHORIZATION, "Bearer secret-token")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&body));
+        let renamed: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(renamed["old_name"], "x-old");
+        assert_eq!(renamed["name"], "x-new");
+        assert_eq!(renamed["url"], "https://artifacts.example.com/a/x-new");
+
+        // content and history live under the new name, the old URL redirects
+        let (status, body, ct) = send(&app, Request::get("/a/x-new").body(Body::empty()).unwrap()).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body, b"<h1>two</h1>");
+        assert_eq!(ct.as_deref(), Some("text/html; charset=utf-8"));
+        let (status, _, _) = send(&app, Request::get("/a/x-old").body(Body::empty()).unwrap()).await;
+        assert_eq!(status, StatusCode::FOUND);
+
+        let req = Request::get("/api/artifacts/x-new")
+            .header(header::AUTHORIZATION, "Bearer secret-token")
+            .body(Body::empty())
+            .unwrap();
+        let (status, body, _) = send(&app, req).await;
+        assert_eq!(status, StatusCode::OK);
+        let meta: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let versions = meta["versions"].as_array().unwrap();
+        assert_eq!(versions.len(), 1);
+        assert_eq!(versions[0]["sha256"], hex::encode(sha2::Sha256::digest(b"<h1>one</h1>")));
+    }
+
+    #[tokio::test]
+    async fn renamed_artifact_redirects_from_old_url() {
+        let dir = tempfile::tempdir().unwrap();
+        let app = router(test_state(dir.path()), 10 * 1024 * 1024);
+
+        let (status, _, _) = send(&app, auth_put("x-old", "<h1>hi</h1>", &[])).await;
+        assert_eq!(status, StatusCode::CREATED);
+        let (status, _, _) = send(
+            &app,
+            Request::post("/api/artifacts/x-old/rename/x-new")
+                .header(header::AUTHORIZATION, "Bearer secret-token")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+
+        // the old public URL answers with a redirect to the new one
+        let resp = app
+            .clone()
+            .oneshot(Request::get("/a/x-old").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::FOUND);
+        assert_eq!(
+            resp.headers().get(header::LOCATION).unwrap(),
+            "https://artifacts.example.com/a/x-new"
+        );
+
+        // recreating the old name serves the artifact, no redirect
+        let (status, _, _) = send(&app, auth_put("x-old", "<h1>fresh</h1>", &[])).await;
+        assert_eq!(status, StatusCode::CREATED);
+        let (status, body, _) = send(&app, Request::get("/a/x-old").body(Body::empty()).unwrap()).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body, b"<h1>fresh</h1>");
+
+        // a redirect to a deleted artifact is a plain 404
+        let req = Request::delete("/api/artifacts/x-new")
+            .header(header::AUTHORIZATION, "Bearer secret-token")
+            .body(Body::empty())
+            .unwrap();
+        let (status, _, _) = send(&app, req).await;
+        assert_eq!(status, StatusCode::NO_CONTENT);
+        let (status, _, _) = send(&app, Request::get("/a/x-new").body(Body::empty()).unwrap()).await;
         assert_eq!(status, StatusCode::NOT_FOUND);
     }
 
