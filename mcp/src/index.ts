@@ -2,10 +2,14 @@
 /**
  * MCP server for the artifacts storage (https://github.com/morr/artifacts).
  *
- * Tools: list/get/save/update artifacts, list versions, rollback, rename, delete.
+ * Tools: list/get/save/update artifacts, list versions, rollback, rename, delete;
+ * plus image tools: upload/update/list/delete images (public URLs `/i/<name>`
+ * for embedding into artifacts).
  * Reads ARTIFACTS_BASE_URL and ARTIFACTS_TOKEN from the environment;
  * all tool failures come back as isError results with a readable message.
  */
+import { readFile } from "node:fs/promises";
+import { extname } from "node:path";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { z } from "zod";
@@ -19,6 +23,15 @@ const TEXTUAL_CONTENT_TYPES = [
   "application/yaml",
   "image/svg+xml",
 ];
+const IMAGE_TYPES_BY_EXT: Record<string, string> = {
+  ".png": "image/png",
+  ".jpg": "image/jpeg",
+  ".jpeg": "image/jpeg",
+  ".gif": "image/gif",
+  ".webp": "image/webp",
+  ".avif": "image/avif",
+  ".svg": "image/svg+xml",
+};
 
 class ToolError extends Error {}
 
@@ -107,7 +120,108 @@ async function fetchMeta(c: { baseUrl: string; token: string }, name: string): P
   return (await resp.json()) as MetaResponse;
 }
 
-const server = new McpServer({ name: "artifacts", version: "0.1.0" });
+async function fetchImageMeta(c: { baseUrl: string; token: string }, name: string): Promise<MetaResponse> {
+  const resp = await api(`/api/images/${name}`, { ...c, method: "GET" });
+  return (await resp.json()) as MetaResponse;
+}
+
+// --- images ---
+
+interface ImageSource {
+  data: Buffer;
+  /** Content type implied by the source (file extension, HTTP response), if any. */
+  typeHint?: string;
+}
+
+async function resolveImageSource(input: {
+  filePath?: string;
+  sourceUrl?: string;
+  contentBase64?: string;
+}): Promise<ImageSource> {
+  const given = [input.filePath, input.sourceUrl, input.contentBase64].filter((v) => v !== undefined).length;
+  if (given !== 1) {
+    throw new ToolError("provide exactly one image source: filePath, sourceUrl or contentBase64");
+  }
+
+  if (input.filePath !== undefined) {
+    const path = input.filePath;
+    const data = await readFile(path).catch((e: NodeJS.ErrnoException) => {
+      throw new ToolError(`cannot read ${path}: ${e.message}`);
+    });
+    if (data.length === 0) throw new ToolError(`file is empty: ${path}`);
+    return { data, typeHint: IMAGE_TYPES_BY_EXT[extname(path).toLowerCase()] };
+  }
+
+  if (input.sourceUrl !== undefined) {
+    const url = input.sourceUrl;
+    if (!/^https?:\/\//i.test(url)) throw new ToolError(`sourceUrl must be an http(s) URL: ${url}`);
+    const resp = await fetch(url).catch((e: Error) => {
+      throw new ToolError(`cannot fetch ${url}: ${e.message}`);
+    });
+    if (!resp.ok) throw new ToolError(`source fetch failed: ${resp.status} ${resp.statusText}`);
+    const data = Buffer.from(await resp.arrayBuffer());
+    if (data.length === 0) throw new ToolError(`source returned an empty body: ${url}`);
+    // A generic or plainly wrong content type carries no signal — fall back to the default.
+    const bare = resp.headers.get("content-type")?.split(";")[0].trim().toLowerCase();
+    const hint = bare && bare !== "application/octet-stream" && bare !== "text/plain" ? bare : undefined;
+    return { data, typeHint: hint };
+  }
+
+  const data = Buffer.from(input.contentBase64 as string, "base64");
+  if (data.length === 0) throw new ToolError("contentBase64 is empty or not valid base64");
+  return { data };
+}
+
+function assertImageType(contentType: string): string {
+  const bare = contentType.split(";")[0].trim().toLowerCase();
+  if (!/^image\//.test(bare)) {
+    throw new ToolError(`image contentType must be image/* (png, jpeg, gif, webp, avif, svg), got "${contentType}"`);
+  }
+  return bare;
+}
+
+async function putImage(
+  args: {
+    name: string;
+    filePath?: string;
+    sourceUrl?: string;
+    contentBase64?: string;
+    contentType?: string;
+  },
+  mode: "create" | "update",
+) {
+  const c = config();
+  assertName(args.name);
+  const { data, typeHint } = await resolveImageSource(args);
+  let contentType = args.contentType ? assertImageType(args.contentType) : typeHint;
+  if (!contentType) {
+    contentType =
+      mode === "update"
+        ? (await fetchImageMeta(c, args.name)).meta.content_type
+        : "image/png";
+  }
+  contentType = assertImageType(contentType);
+  const resp = await api(`/api/images/${args.name}`, {
+    ...c,
+    method: "PUT",
+    headers: {
+      "Content-Type": contentType,
+      [mode === "create" ? "X-Create-Only" : "X-Update-Only"]: "true",
+    },
+    body: new Uint8Array(data),
+  });
+  const result = (await resp.json()) as {
+    name: string;
+    url: string;
+    content_type: string;
+    size: number;
+    sha256: string;
+    created: boolean;
+  };
+  return { content: [{ type: "text" as const, text: JSON.stringify(result, null, 2) }] };
+}
+
+const server = new McpServer({ name: "artifacts", version: "0.2.0" });
 
 server.registerTool(
   "list_artifacts",
@@ -288,6 +402,85 @@ server.registerTool(
     const c = config();
     assertName(name);
     await api(`/api/artifacts/${name}`, { ...c, method: "DELETE" });
+    return { content: [{ type: "text", text: JSON.stringify({ name, deleted: true }, null, 2) }] };
+  },
+);
+
+server.registerTool(
+  "upload_image",
+  {
+    title: "Upload image",
+    description:
+      "Upload a NEW image (screenshot, photo, generated picture) to the storage and get its public URL " +
+      "(<base>/i/<name>) for embedding into artifacts, e.g. <img src>. Fails if the name already exists " +
+      "(use update_image then). Provide exactly one source: filePath (local image file), sourceUrl " +
+      "(http(s) URL to download) or contentBase64 (raw bytes encoded as base64 — prefer filePath/sourceUrl " +
+      'for anything large). contentType must be image/*; default: from the file extension or the source ' +
+      'response, else "image/png".',
+    inputSchema: {
+      name: z.string().describe(`Image name, ${NAME_RULE}`),
+      filePath: z.string().optional().describe("Local image file to read the bytes from"),
+      sourceUrl: z.string().optional().describe("http(s) URL to download the image from"),
+      contentBase64: z.string().optional().describe("Image bytes encoded as base64"),
+      contentType: z.string().optional().describe('MIME type, must be image/*, e.g. "image/png"'),
+    },
+  },
+  async (args) => putImage(args, "create"),
+);
+
+server.registerTool(
+  "update_image",
+  {
+    title: "Update image",
+    description:
+      "Replace the bytes of an EXISTING image, keeping its public URL (<base>/i/<name>); the previous " +
+      "version is archived. Fails if the image does not exist (use upload_image then). Sources are the " +
+      "same as upload_image (exactly one of filePath, sourceUrl, contentBase64); contentType default: " +
+      "from the source, else the image's current type.",
+    inputSchema: {
+      name: z.string().describe(`Image name, ${NAME_RULE}`),
+      filePath: z.string().optional().describe("Local image file to read the bytes from"),
+      sourceUrl: z.string().optional().describe("http(s) URL to download the image from"),
+      contentBase64: z.string().optional().describe("Image bytes encoded as base64"),
+      contentType: z.string().optional().describe('MIME type, must be image/*, e.g. "image/png"'),
+    },
+  },
+  async (args) => putImage(args, "update"),
+);
+
+server.registerTool(
+  "list_images",
+  {
+    title: "List images",
+    description:
+      "List uploaded images with their public URLs (<base>/i/<name>), newest info per image. " +
+      'Optional prefix filters by name, e.g. prefix="report-1-".',
+    inputSchema: { prefix: z.string().optional() },
+  },
+  async ({ prefix }) => {
+    const c = config();
+    const resp = await api(`/api/images${prefix ? `?prefix=${encodeURIComponent(prefix)}` : ""}`, {
+      ...c,
+      method: "GET",
+    });
+    const items = (await resp.json()) as ListRow[];
+    return { content: [{ type: "text", text: JSON.stringify(items, null, 2) }] };
+  },
+);
+
+server.registerTool(
+  "delete_image",
+  {
+    title: "Delete image",
+    description:
+      "Delete an image together with its versions. Irreversible; every artifact embedding it by URL " +
+      "will show a broken image.",
+    inputSchema: { name: z.string().describe(`Image name, ${NAME_RULE}`) },
+  },
+  async ({ name }) => {
+    const c = config();
+    assertName(name);
+    await api(`/api/images/${name}`, { ...c, method: "DELETE" });
     return { content: [{ type: "text", text: JSON.stringify({ name, deleted: true }, null, 2) }] };
   },
 );
