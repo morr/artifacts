@@ -69,6 +69,7 @@ pub fn router(state: SharedState, max_body: usize) -> Router {
         .route("/healthz", get(|| async { "ok" }))
         .route("/api/artifacts", get(list_artifacts))
         .route("/api/artifacts/{name}", get(get_meta).put(put_artifact).delete(delete_artifact))
+        .route("/api/artifacts/{name}/content", get(get_artifact_content))
         .route("/api/artifacts/{name}/versions/{version}", get(get_version))
         .route("/api/artifacts/{name}/rollback/{version}", post(rollback))
         .route("/api/artifacts/{name}/rename/{new_name}", post(rename_artifact))
@@ -344,6 +345,24 @@ async fn get_meta(State(state): State<SharedState>, _auth: Authed, Path(name): P
             });
             Json(body).into_response()
         }
+        Ok(None) => error_response(StatusCode::NOT_FOUND, "artifact not found"),
+        Err(e) => storage_error(e),
+    }
+}
+
+/// Raw stored bytes. Unlike the public `/a/{name}`, text/html is served
+/// without the injected live-reload script — API consumers round-tripping
+/// content (get_artifact → edit → put) need the bytes exactly as stored.
+async fn get_artifact_content(
+    State(state): State<SharedState>,
+    _auth: Authed,
+    Path(name): Path<String>,
+) -> Response {
+    if let Some(resp) = bad_name(&name) {
+        return resp;
+    }
+    match state.store.get_current(&name) {
+        Ok(Some((content, meta))) => build_content_response(content, &meta.content_type),
         Ok(None) => error_response(StatusCode::NOT_FOUND, "artifact not found"),
         Err(e) => storage_error(e),
     }
@@ -672,6 +691,7 @@ mod tests {
         for (method, path) in [
             (axum::http::Method::GET, "/api/artifacts"),
             (axum::http::Method::GET, "/api/artifacts/x-report"),
+            (axum::http::Method::GET, "/api/artifacts/x-report/content"),
             (axum::http::Method::PUT, "/api/artifacts/x-report"),
             (axum::http::Method::POST, "/api/artifacts/x-report/rename/x-new"),
             (axum::http::Method::DELETE, "/api/artifacts/x-report"),
@@ -753,6 +773,39 @@ mod tests {
         assert_eq!(status, StatusCode::NO_CONTENT);
         let (status, _, _) = send(&app, Request::get("/a/x-report").body(Body::empty()).unwrap()).await;
         assert_eq!(status, StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn content_route_serves_raw_html_without_live_script() {
+        let dir = tempfile::tempdir().unwrap();
+        let app = router(test_state(dir.path()), 10 * 1024 * 1024);
+
+        let (status, _, _) = send(&app, auth_put("x-raw", "<html><body><p>hi</p></body></html>", &[])).await;
+        assert_eq!(status, StatusCode::CREATED);
+
+        // authenticated content route: stored bytes verbatim, stored type
+        let req = Request::get("/api/artifacts/x-raw/content")
+            .header(header::AUTHORIZATION, "Bearer secret-token")
+            .body(Body::empty())
+            .unwrap();
+        let (status, body, ct) = send(&app, req).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body, b"<html><body><p>hi</p></body></html>");
+        assert_eq!(ct.as_deref(), Some("text/html; charset=utf-8"));
+
+        // missing artifact is 404, invalid name is 400
+        let req = Request::get("/api/artifacts/x-nope/content")
+            .header(header::AUTHORIZATION, "Bearer secret-token")
+            .body(Body::empty())
+            .unwrap();
+        let (status, _, _) = send(&app, req).await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        let req = Request::get("/api/artifacts/Bad_Name/content")
+            .header(header::AUTHORIZATION, "Bearer secret-token")
+            .body(Body::empty())
+            .unwrap();
+        let (status, _, _) = send(&app, req).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
     }
 
     #[tokio::test]

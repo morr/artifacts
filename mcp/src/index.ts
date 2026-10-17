@@ -8,21 +8,15 @@
  * Reads ARTIFACTS_BASE_URL and ARTIFACTS_TOKEN from the environment;
  * all tool failures come back as isError results with a readable message.
  */
-import { readFile } from "node:fs/promises";
-import { extname } from "node:path";
+import { mkdir, readFile, writeFile } from "node:fs/promises";
+import { dirname, extname, join } from "node:path";
+import { tmpdir } from "node:os";
+import { createHash } from "node:crypto";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { z } from "zod";
 
 const NAME_RULE = "must match ^[a-z0-9][a-z0-9-]{0,63}$";
-const TEXTUAL_CONTENT_TYPES = [
-  "text/",
-  "application/json",
-  "application/xml",
-  "application/javascript",
-  "application/yaml",
-  "image/svg+xml",
-];
 const IMAGE_TYPES_BY_EXT: Record<string, string> = {
   ".png": "image/png",
   ".jpg": "image/jpeg",
@@ -78,9 +72,42 @@ function assertName(name: string): string {
   return name;
 }
 
-function textual(contentType: string): boolean {
-  const ct = contentType.split(";")[0].trim().toLowerCase();
-  return TEXTUAL_CONTENT_TYPES.some((prefix) => ct.startsWith(prefix));
+const sha256Hex = (data: Buffer): string => createHash("sha256").update(data).digest("hex");
+
+// Extension for the default get_artifact download path; anything unknown is .bin.
+const EXTENSIONS_BY_CONTENT_TYPE: Record<string, string> = {
+  "text/html": ".html",
+  "text/plain": ".txt",
+  "text/markdown": ".md",
+  "text/css": ".css",
+  "text/csv": ".csv",
+  "application/json": ".json",
+  "application/xml": ".xml",
+  "application/javascript": ".js",
+  "application/yaml": ".yaml",
+  "image/svg+xml": ".svg",
+};
+
+function defaultArtifactPath(name: string, contentType: string): string {
+  const bare = contentType.split(";")[0].trim().toLowerCase();
+  return join(tmpdir(), "artifacts", `${name}${EXTENSIONS_BY_CONTENT_TYPE[bare] ?? ".bin"}`);
+}
+
+// Content for save/update: exactly one of an inline string or a local file.
+// The file form keeps large content out of the model context — the usual edit
+// loop is get_artifact (writes a file) → edit that file → update with filePath.
+async function resolveContent(input: { content?: string; filePath?: string }): Promise<Buffer> {
+  const given = [input.content, input.filePath].filter((v) => v !== undefined).length;
+  if (given !== 1) throw new ToolError("provide exactly one of content or filePath");
+  if (input.filePath !== undefined) {
+    const path = input.filePath;
+    const data = await readFile(path).catch((e: NodeJS.ErrnoException) => {
+      throw new ToolError(`cannot read ${path}: ${e.message}`);
+    });
+    if (data.length === 0) throw new ToolError(`file is empty: ${path}`);
+    return data;
+  }
+  return Buffer.from(input.content as string, "utf-8");
 }
 
 // Result rows returned to the model: plain JSON strings, compact.
@@ -221,7 +248,7 @@ async function putImage(
   return { content: [{ type: "text" as const, text: JSON.stringify(result, null, 2) }] };
 }
 
-const server = new McpServer({ name: "artifacts", version: "0.2.0" });
+const server = new McpServer({ name: "artifacts", version: "0.3.0" });
 
 server.registerTool(
   "list_artifacts",
@@ -247,25 +274,53 @@ server.registerTool(
   {
     title: "Get artifact",
     description:
-      "Fetch an artifact's current content, metadata and public URL. Text content types come back as text, binary as base64.",
-    inputSchema: { name: z.string().describe(`Artifact name, ${NAME_RULE}`) },
+      "Fetch an artifact's current content, metadata and public URL. The content is written to a local file " +
+      "(default <tmpdir>/artifacts/<name>.<ext>, override with filePath — it is overwritten); the result carries " +
+      "only metadata plus the path, never the content itself, so it can't be truncated. Read the file with file " +
+      "tools; to publish edits, update_artifact with filePath — the content never has to pass through the model.",
+    inputSchema: {
+      name: z.string().describe(`Artifact name, ${NAME_RULE}`),
+      filePath: z.string().optional().describe("Local file to write the content to; default <tmpdir>/artifacts/<name>.<ext>"),
+    },
   },
-  async ({ name }) => {
+  async ({ name, filePath }) => {
     const c = config();
     assertName(name);
     const meta = await fetchMeta(c, name);
-    const resp = await fetch(`${c.baseUrl}/a/${name}`);
-    if (!resp.ok) throw new ToolError(`artifacts API ${resp.status} ${resp.statusText}`);
-    const buf = Buffer.from(await resp.arrayBuffer());
-    const isText = textual(meta.meta.content_type);
+
+    // Raw stored bytes via the authenticated content route. The public /a/
+    // route (fallback for servers without it) serves text/html with the
+    // live-reload script injected; the sha mismatch detects that precisely.
+    let buf: Buffer;
+    let warning: string | undefined;
+    const raw = await api(`/api/artifacts/${name}/content`, { ...c, method: "GET" }).catch(() => null);
+    if (raw) {
+      buf = Buffer.from(await raw.arrayBuffer());
+    } else {
+      const resp = await fetch(`${c.baseUrl}/a/${name}`);
+      if (!resp.ok) throw new ToolError(`artifacts API ${resp.status} ${resp.statusText}`);
+      buf = Buffer.from(await resp.arrayBuffer());
+      if (meta.meta.content_type.startsWith("text/html") && sha256Hex(buf) !== meta.meta.sha256) {
+        warning =
+          "this artifacts server predates the /content route, so the file was fetched from the public " +
+          "route and its HTML carries the injected live-reload script; re-uploading it would store that " +
+          "script — deploy the updated artifacts server before round-tripping HTML through get_artifact";
+      }
+    }
+
+    const path = filePath ?? defaultArtifactPath(name, meta.meta.content_type);
+    await mkdir(dirname(path), { recursive: true });
+    await writeFile(path, buf);
     const result = {
       name,
       url: meta.url,
       contentType: meta.meta.content_type,
+      size: buf.length,
+      sha256: sha256Hex(buf),
       updatedAt: meta.meta.updated_at,
       versionCount: meta.versions.length,
-      encoding: isText ? "utf-8" : "base64",
-      content: isText ? buf.toString("utf-8") : buf.toString("base64"),
+      path,
+      ...(warning ? { warning } : {}),
     };
     return { content: [{ type: "text", text: JSON.stringify(result, null, 2) }] };
   },
@@ -277,16 +332,19 @@ server.registerTool(
     title: "Save (create) artifact",
     description:
       "Create a NEW artifact in the storage. Fails if the name already exists (use update_artifact then). " +
+      "Content comes from exactly one of content (inline string) or filePath (local file). " +
       'contentType defaults to "text/html; charset=utf-8". Returns the public URL the artifact is served at.',
     inputSchema: {
       name: z.string().describe(`Artifact name, ${NAME_RULE}`),
-      content: z.string().describe("Full artifact content (e.g. the whole HTML document)"),
+      content: z.string().optional().describe("Full artifact content (e.g. the whole HTML document)"),
+      filePath: z.string().optional().describe("Local file to upload the content from"),
       contentType: z.string().optional().describe('MIME type, default "text/html; charset=utf-8"'),
     },
   },
-  async ({ name, content, contentType }) => {
+  async ({ name, content, filePath, contentType }) => {
     const c = config();
     assertName(name);
+    const data = await resolveContent({ content, filePath });
     const resp = await api(`/api/artifacts/${name}`, {
       ...c,
       method: "PUT",
@@ -294,10 +352,12 @@ server.registerTool(
         "Content-Type": contentType ?? "text/html; charset=utf-8",
         "X-Create-Only": "true",
       },
-      body: content,
+      body: new Uint8Array(data),
     });
     const result = (await resp.json()) as { name: string; url: string; created: boolean };
-    return { content: [{ type: "text", text: JSON.stringify(result, null, 2) }] };
+    return {
+      content: [{ type: "text", text: JSON.stringify({ ...result, size: data.length, sha256: sha256Hex(data) }, null, 2) }],
+    };
   },
 );
 
@@ -307,16 +367,20 @@ server.registerTool(
     title: "Update artifact",
     description:
       "Replace the content of an EXISTING artifact; the previous version is archived and can be rolled back. " +
-      "Fails if the artifact does not exist (use save_artifact then). contentType defaults to the artifact's current one.",
+      "Fails if the artifact does not exist (use save_artifact then). Content comes from exactly one of content " +
+      "(inline string) or filePath (local file) — for editing an existing artifact prefer the loop get_artifact → " +
+      "edit the file → update_artifact with filePath. contentType defaults to the artifact's current one.",
     inputSchema: {
       name: z.string().describe(`Artifact name, ${NAME_RULE}`),
-      content: z.string().describe("Full new artifact content"),
+      content: z.string().optional().describe("Full new artifact content"),
+      filePath: z.string().optional().describe("Local file to upload the new content from"),
       contentType: z.string().optional().describe("New MIME type; omit to keep the current one"),
     },
   },
-  async ({ name, content, contentType }) => {
+  async ({ name, content, filePath, contentType }) => {
     const c = config();
     assertName(name);
+    const data = await resolveContent({ content, filePath });
     let type = contentType;
     if (!type) {
       const meta = await fetchMeta(c, name);
@@ -326,10 +390,12 @@ server.registerTool(
       ...c,
       method: "PUT",
       headers: { "Content-Type": type, "X-Update-Only": "true" },
-      body: content,
+      body: new Uint8Array(data),
     });
     const result = (await resp.json()) as { name: string; url: string; created: boolean };
-    return { content: [{ type: "text", text: JSON.stringify(result, null, 2) }] };
+    return {
+      content: [{ type: "text", text: JSON.stringify({ ...result, size: data.length, sha256: sha256Hex(data) }, null, 2) }],
+    };
   },
 );
 

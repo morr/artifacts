@@ -37,6 +37,7 @@ rollback for images — replace with an update or delete and re-upload.
 | GET | `/healthz` | public; for kamal-proxy |
 | GET | `/api/artifacts?prefix=` | list: name, content type, size, updated_at |
 | GET | `/api/artifacts/{name}` | meta + version history + public URL |
+| GET | `/api/artifacts/{name}/content` | raw current bytes with the stored content type — unlike the public `GET /a/{name}`, text/html is served without the injected live-reload script |
 | PUT | `/api/artifacts/{name}` | body = content; `X-Create-Only: true` → 409 if exists; `X-Update-Only: true` → 404 if missing; otherwise upsert. Content type taken from the request `Content-Type` |
 | GET | `/api/artifacts/{name}/versions/{version}` | download a specific version |
 | POST | `/api/artifacts/{name}/rollback/{version}` | make a version current (outgoing current is archived) |
@@ -79,6 +80,14 @@ TypeScript MCP server over stdio with tools `list_artifacts`, `get_artifact`,
 `upload_image` / `update_image` (sources: local `filePath`, `sourceUrl` or
 `contentBase64`), `list_images`, `delete_image`. Responses include the public URL
 (`/a/<name>`, images `/i/<name>`) so an agent can hand the link straight to the user.
+
+Large content never passes through the model context: `get_artifact` writes the
+current content to a local file (default `<tmpdir>/artifacts/<name>.<ext>`,
+override with `filePath`) and returns metadata plus the path; `save_artifact` /
+`update_artifact` take either an inline `content` string or a `filePath` to
+upload from — the edit loop is get → edit the file → update with `filePath`.
+It uses `GET /api/artifacts/{name}/content` for raw bytes and falls back to the
+public route on older servers, flagging injected-script content with a `warning`.
 
 ```sh
 cd mcp && npm install && npm run build
