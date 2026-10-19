@@ -204,28 +204,43 @@ async fn live_artifact(State(state): State<SharedState>, Path(name): Path<String
 
 /// Client side of live reload, injected into served HTML: an EventSource on
 /// `/a/{name}/live`, a scroll-preserving `location.reload()` on updates and
-/// `location.replace()` to the new URL on renames, plus a small fading toast
-/// telling the reader the page changed. sessionStorage is per-tab, so tabs
-/// don't steal each other's scroll.
+/// `location.replace()` to the new URL on renames, plus timestamped toasts
+/// telling the reader the page changed. Toasts never fade on their own — each
+/// click dismisses one — and stack, so a burst of updates reads as a log.
+/// Messages accumulate in sessionStorage across reloads (per-tab, so tabs
+/// don't steal each other's scroll), capped at the last 20.
 const LIVE_SCRIPT: &str = r#"<script>
 (function () {
   var name = "__NAME__";
   var prefix = "artifacts-live-scroll:";
   var key = prefix + name;
+  function clock() {
+    var d = new Date();
+    function p(n) { return (n < 10 ? "0" : "") + n; }
+    return p(d.getHours()) + ":" + p(d.getMinutes()) + ":" + p(d.getSeconds());
+  }
+  function box() {
+    var c = document.getElementById("artifacts-live-notes");
+    if (!c) {
+      c = document.createElement("div");
+      c.id = "artifacts-live-notes";
+      c.style.cssText = "position:fixed;right:16px;bottom:16px;z-index:2147483647;"
+        + "display:flex;flex-direction:column;gap:6px;align-items:flex-end;";
+      document.body.appendChild(c);
+    }
+    return c;
+  }
   function toast(text) {
     if (!document.body) return;
     var el = document.createElement("div");
     el.setAttribute("role", "status");
     el.textContent = text;
-    el.style.cssText = "position:fixed;right:16px;bottom:16px;z-index:2147483647;pointer-events:none;"
+    el.title = "скрыть";
+    el.style.cssText = "pointer-events:auto;cursor:pointer;"
       + "background:rgba(23,23,23,.8);color:#fafafa;font:500 12px/1.4 ui-sans-serif,system-ui,sans-serif;"
-      + "padding:6px 10px;border-radius:8px;opacity:0;transition:opacity .4s";
-    document.body.appendChild(el);
-    requestAnimationFrame(function () { el.style.opacity = "1"; });
-    setTimeout(function () {
-      el.style.opacity = "0";
-      setTimeout(function () { el.remove(); }, 500);
-    }, 3000);
+      + "padding:6px 10px;border-radius:8px";
+    el.addEventListener("click", function () { el.remove(); });
+    box().appendChild(el);
   }
   function restore() {
     var raw = null;
@@ -242,15 +257,24 @@ const LIVE_SCRIPT: &str = r#"<script>
     scroll();
     window.addEventListener("load", scroll);
     if (info.msg) toast(info.msg);
+    if (Array.isArray(info.msgs)) info.msgs.forEach(function (m) { toast(m); });
   }
   if (document.readyState === "loading") document.addEventListener("DOMContentLoaded", restore);
   else restore();
   function save(to, msg) {
-    try { sessionStorage.setItem(prefix + to, JSON.stringify({ y: window.scrollY, msg: msg })); } catch (e) {}
+    try {
+      var info = {};
+      try { info = JSON.parse(sessionStorage.getItem(prefix + to)) || {}; } catch (e) {}
+      info.y = window.scrollY;
+      if (!Array.isArray(info.msgs)) info.msgs = [];
+      info.msgs.push(msg);
+      if (info.msgs.length > 20) info.msgs = info.msgs.slice(-20);
+      sessionStorage.setItem(prefix + to, JSON.stringify(info));
+    } catch (e) {}
   }
   var source = new EventSource("/a/" + name + "/live");
   source.addEventListener("updated", function () {
-    save(name, "обновлено");
+    save(name, "обновлено в " + clock());
     location.reload();
   });
   source.addEventListener("renamed", function (ev) {
