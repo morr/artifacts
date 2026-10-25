@@ -15,13 +15,12 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use serde::{Deserialize, Serialize};
-use sha2::Digest;
 use subtle::ConstantTimeEq;
 use tokio_stream::wrappers::errors::BroadcastStreamRecvError;
 use tokio_stream::wrappers::BroadcastStream;
 use tokio_stream::StreamExt as _;
 
-use crate::store::{FileStore, PutOutcome, RenameOutcome, NAME_RULE};
+use crate::store::{FileStore, Meta, PutError, PutOutcome, RenameOutcome, NAME_RULE};
 
 pub struct AppState {
     pub store: FileStore,
@@ -409,6 +408,23 @@ fn create_update_flags(headers: &HeaderMap) -> Result<(bool, bool), Response> {
     }
 }
 
+/// `X-Expected-Rev: <n>` — optimistic-concurrency guard for PUT: the write
+/// applies only if `n` is the current rev, else 409 with the current one.
+/// Absent header means unconditional.
+fn expected_rev(headers: &HeaderMap) -> Result<Option<u64>, Response> {
+    match headers.get("x-expected-rev") {
+        None => Ok(None),
+        Some(value) => match value.to_str().map_err(|_| bad_expected_rev())?.trim().parse::<u64>() {
+            Ok(rev) => Ok(Some(rev)),
+            Err(_) => Err(bad_expected_rev()),
+        },
+    }
+}
+
+fn bad_expected_rev() -> Response {
+    error_response(StatusCode::BAD_REQUEST, "x-expected-rev must be a non-negative integer")
+}
+
 async fn put_artifact(
     State(state): State<SharedState>,
     _auth: Authed,
@@ -423,6 +439,16 @@ async fn put_artifact(
         Ok(flags) => flags,
         Err(resp) => return resp,
     };
+    let expect_rev = match expected_rev(&headers) {
+        Ok(rev) => rev,
+        Err(resp) => return resp,
+    };
+    if create_only && expect_rev.is_some() {
+        return error_response(
+            StatusCode::BAD_REQUEST,
+            "x-expected-rev guards updates and is meaningless with x-create-only",
+        );
+    }
 
     let exists = state.store.exists(&name);
     if create_only && exists {
@@ -438,24 +464,36 @@ async fn put_artifact(
         .unwrap_or("text/plain; charset=utf-8")
         .to_string();
 
-    match state.store.put(&name, &body, &content_type) {
-        Ok(PutOutcome::Created) => {
+    match state.store.put(&name, &body, &content_type, expect_rev) {
+        Ok((PutOutcome::Created, meta)) => {
             let _ = state.events.send(ArtifactEvent::Updated { name: name.clone() });
-            (StatusCode::CREATED, Json(put_body(&state, &name, true))).into_response()
+            (StatusCode::CREATED, Json(put_body(&state, &name, &meta, true))).into_response()
         }
-        Ok(PutOutcome::Updated) => {
+        Ok((PutOutcome::Updated, meta)) => {
             let _ = state.events.send(ArtifactEvent::Updated { name: name.clone() });
-            Json(put_body(&state, &name, false)).into_response()
+            Json(put_body(&state, &name, &meta, false)).into_response()
         }
-        Ok(PutOutcome::Unchanged) => Json(put_body(&state, &name, false)).into_response(),
-        Err(e) => storage_error(e),
+        Ok((PutOutcome::Unchanged, meta)) => Json(put_body(&state, &name, &meta, false)).into_response(),
+        Err(PutError::RevConflict { current }) => {
+            let expected = expect_rev.map(|r| r.to_string()).unwrap_or_else(|| "none".into());
+            error_response(
+                StatusCode::CONFLICT,
+                &format!(
+                    "version conflict: request expected rev {expected} but current is {current} — \
+                     the artifact was updated by someone else; refetch it and re-apply your \
+                     changes on top of the current content"
+                ),
+            )
+        }
+        Err(PutError::Io(e)) => storage_error(e),
     }
 }
 
-fn put_body(state: &SharedState, name: &str, created: bool) -> serde_json::Value {
+fn put_body(state: &SharedState, name: &str, meta: &Meta, created: bool) -> serde_json::Value {
     serde_json::json!({
         "name": name,
         "url": public_url(state, "a", name),
+        "rev": meta.rev,
         "created": created,
     })
 }
@@ -588,13 +626,14 @@ fn image_content_type(headers: &HeaderMap) -> Option<String> {
     bare.starts_with("image/").then_some(bare)
 }
 
-fn image_body(state: &SharedState, name: &str, created: bool, content_type: &str, body: &[u8]) -> serde_json::Value {
+fn image_body(state: &SharedState, name: &str, created: bool, meta: &Meta) -> serde_json::Value {
     serde_json::json!({
         "name": name,
         "url": public_url(state, "i", name),
-        "content_type": content_type,
-        "size": body.len(),
-        "sha256": hex::encode(sha2::Sha256::digest(body)),
+        "content_type": meta.content_type,
+        "size": meta.size,
+        "sha256": meta.sha256,
+        "rev": meta.rev,
         "created": created,
     })
 }
@@ -613,6 +652,16 @@ async fn put_image(
         Ok(flags) => flags,
         Err(resp) => return resp,
     };
+    let expect_rev = match expected_rev(&headers) {
+        Ok(rev) => rev,
+        Err(resp) => return resp,
+    };
+    if create_only && expect_rev.is_some() {
+        return error_response(
+            StatusCode::BAD_REQUEST,
+            "x-expected-rev guards updates and is meaningless with x-create-only",
+        );
+    }
     let Some(content_type) = image_content_type(&headers) else {
         return error_response(
             StatusCode::UNSUPPORTED_MEDIA_TYPE,
@@ -628,16 +677,26 @@ async fn put_image(
         return error_response(StatusCode::NOT_FOUND, "image not found");
     }
 
-    match state.images.put(&name, &body, &content_type) {
-        Ok(PutOutcome::Created) => (
+    match state.images.put(&name, &body, &content_type, expect_rev) {
+        Ok((PutOutcome::Created, meta)) => (
             StatusCode::CREATED,
-            Json(image_body(&state, &name, true, &content_type, &body)),
+            Json(image_body(&state, &name, true, &meta)),
         )
             .into_response(),
-        Ok(PutOutcome::Updated | PutOutcome::Unchanged) => {
-            Json(image_body(&state, &name, false, &content_type, &body)).into_response()
+        Ok((PutOutcome::Updated | PutOutcome::Unchanged, meta)) => {
+            Json(image_body(&state, &name, false, &meta)).into_response()
         }
-        Err(e) => storage_error(e),
+        Err(PutError::RevConflict { current }) => {
+            let expected = expect_rev.map(|r| r.to_string()).unwrap_or_else(|| "none".into());
+            error_response(
+                StatusCode::CONFLICT,
+                &format!(
+                    "version conflict: request expected rev {expected} but current is {current} — \
+                     the image was updated by someone else; refetch it and re-apply your changes"
+                ),
+            )
+        }
+        Err(PutError::Io(e)) => storage_error(e),
     }
 }
 
@@ -855,6 +914,65 @@ mod tests {
         let (status, _, _) = send(&app, Request::get("/").body(Body::empty()).unwrap()).await;
         assert_eq!(status, StatusCode::NOT_FOUND);
         let (status, _, _) = send(&app, Request::get("/api").body(Body::empty()).unwrap()).await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn conditional_update_is_guarded_by_expected_rev() {
+        let dir = tempfile::tempdir().unwrap();
+        let app = router(test_state(dir.path()), 10 * 1024 * 1024);
+
+        // create reports rev 1
+        let (status, body, _) = send(&app, auth_put("x-rev", "<h1>one</h1>", &[])).await;
+        assert_eq!(status, StatusCode::CREATED, "{}", String::from_utf8_lossy(&body));
+        let created: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(created["rev"], 1);
+
+        // matching rev updates and reports the bumped one
+        let (status, body, _) = send(&app, auth_put("x-rev", "<h1>two</h1>", &[("x-expected-rev", "1")])).await;
+        assert_eq!(status, StatusCode::OK);
+        let updated: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(updated["rev"], 2);
+
+        // stale rev is a 409 naming the current one; the content stays put
+        let (status, body, _) = send(&app, auth_put("x-rev", "<h1>three</h1>", &[("x-expected-rev", "1")])).await;
+        assert_eq!(status, StatusCode::CONFLICT);
+        let err: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert!(err["error"].as_str().unwrap().contains("current is 2"));
+        let (_, body, _) = send(&app, Request::get("/a/x-rev").body(Body::empty()).unwrap()).await;
+        assert!(String::from_utf8_lossy(&body).starts_with("<h1>two</h1>"));
+
+        // matching rev with identical content: Unchanged, rev stays
+        let (status, body, _) = send(&app, auth_put("x-rev", "<h1>two</h1>", &[("x-expected-rev", "2")])).await;
+        assert_eq!(status, StatusCode::OK);
+        let unchanged: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(unchanged["rev"], 2);
+
+        // the meta route carries the rev too
+        let req = Request::get("/api/artifacts/x-rev")
+            .header(header::AUTHORIZATION, "Bearer secret-token")
+            .body(Body::empty())
+            .unwrap();
+        let (_, body, _) = send(&app, req).await;
+        let meta: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(meta["meta"]["rev"], 2);
+
+        // x-expected-rev with x-create-only, and a garbage header, are 400
+        let (status, _, _) = send(
+            &app,
+            auth_put("x-other", "x", &[("x-create-only", "true"), ("x-expected-rev", "1")]),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        let (status, _, _) = send(&app, auth_put("x-rev", "x", &[("x-expected-rev", "abc")])).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+
+        // conditional update of a missing artifact stays the regular 404
+        let (status, _, _) = send(
+            &app,
+            auth_put("x-missing", "x", &[("x-update-only", "true"), ("x-expected-rev", "1")]),
+        )
+        .await;
         assert_eq!(status, StatusCode::NOT_FOUND);
     }
 

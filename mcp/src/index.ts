@@ -128,6 +128,7 @@ interface VersionRow {
 }
 
 interface MetaRow {
+  rev: number;
   content_type: string;
   created_at: string;
   updated_at: string;
@@ -248,7 +249,7 @@ async function putImage(
   return { content: [{ type: "text" as const, text: JSON.stringify(result, null, 2) }] };
 }
 
-const server = new McpServer({ name: "artifacts", version: "0.3.0" });
+const server = new McpServer({ name: "artifacts", version: "0.4.0" });
 
 server.registerTool(
   "list_artifacts",
@@ -277,7 +278,9 @@ server.registerTool(
       "Fetch an artifact's current content, metadata and public URL. The content is written to a local file " +
       "(default <tmpdir>/artifacts/<name>.<ext>, override with filePath — it is overwritten); the result carries " +
       "only metadata plus the path, never the content itself, so it can't be truncated. Read the file with file " +
-      "tools; to publish edits, update_artifact with filePath — the content never has to pass through the model.",
+      "tools; to publish edits, update_artifact with filePath — the content never has to pass through the model. " +
+      "The result's rev is the concurrency token: pass it as expectedRev to update_artifact so an update by a " +
+      "parallel agent can't be silently overwritten.",
     inputSchema: {
       name: z.string().describe(`Artifact name, ${NAME_RULE}`),
       filePath: z.string().optional().describe("Local file to write the content to; default <tmpdir>/artifacts/<name>.<ext>"),
@@ -314,6 +317,7 @@ server.registerTool(
     const result = {
       name,
       url: meta.url,
+      rev: meta.meta.rev,
       contentType: meta.meta.content_type,
       size: buf.length,
       sha256: sha256Hex(buf),
@@ -333,7 +337,8 @@ server.registerTool(
     description:
       "Create a NEW artifact in the storage. Fails if the name already exists (use update_artifact then). " +
       "Content comes from exactly one of content (inline string) or filePath (local file). " +
-      'contentType defaults to "text/html; charset=utf-8". Returns the public URL the artifact is served at.',
+      'contentType defaults to "text/html; charset=utf-8". Returns the public URL the artifact is served at ' +
+      "and the rev to pass as expectedRev to follow-up update_artifact calls.",
     inputSchema: {
       name: z.string().describe(`Artifact name, ${NAME_RULE}`),
       content: z.string().optional().describe("Full artifact content (e.g. the whole HTML document)"),
@@ -354,7 +359,7 @@ server.registerTool(
       },
       body: new Uint8Array(data),
     });
-    const result = (await resp.json()) as { name: string; url: string; created: boolean };
+    const result = (await resp.json()) as { name: string; url: string; rev?: number; created: boolean };
     return {
       content: [{ type: "text", text: JSON.stringify({ ...result, size: data.length, sha256: sha256Hex(data) }, null, 2) }],
     };
@@ -369,15 +374,25 @@ server.registerTool(
       "Replace the content of an EXISTING artifact; the previous version is archived and can be rolled back. " +
       "Fails if the artifact does not exist (use save_artifact then). Content comes from exactly one of content " +
       "(inline string) or filePath (local file) — for editing an existing artifact prefer the loop get_artifact → " +
-      "edit the file → update_artifact with filePath. contentType defaults to the artifact's current one.",
+      "edit the file → update_artifact with filePath. contentType defaults to the artifact's current one. " +
+      "expectedRev is the concurrency guard: pass the rev from the get_artifact, save_artifact or last " +
+      "update_artifact result; if it no longer matches (another agent updated the artifact in the meantime), " +
+      "the update fails with a version conflict and nothing is written — re-read the artifact with get_artifact, " +
+      "re-apply your changes on top of the fresh content, and update again with the new rev. Several agents may " +
+      "work on the same artifact, so always pass expectedRev.",
     inputSchema: {
       name: z.string().describe(`Artifact name, ${NAME_RULE}`),
       content: z.string().optional().describe("Full new artifact content"),
       filePath: z.string().optional().describe("Local file to upload the new content from"),
       contentType: z.string().optional().describe("New MIME type; omit to keep the current one"),
+      expectedRev: z
+        .number()
+        .int()
+        .optional()
+        .describe("Rev from get_artifact / save_artifact / the last update_artifact result; update fails with a version conflict if it is no longer current"),
     },
   },
-  async ({ name, content, filePath, contentType }) => {
+  async ({ name, content, filePath, contentType, expectedRev }) => {
     const c = config();
     assertName(name);
     const data = await resolveContent({ content, filePath });
@@ -389,10 +404,14 @@ server.registerTool(
     const resp = await api(`/api/artifacts/${name}`, {
       ...c,
       method: "PUT",
-      headers: { "Content-Type": type, "X-Update-Only": "true" },
+      headers: {
+        "Content-Type": type,
+        "X-Update-Only": "true",
+        ...(expectedRev !== undefined ? { "X-Expected-Rev": String(expectedRev) } : {}),
+      },
       body: new Uint8Array(data),
     });
-    const result = (await resp.json()) as { name: string; url: string; created: boolean };
+    const result = (await resp.json()) as { name: string; url: string; rev?: number; created: boolean };
     return {
       content: [{ type: "text", text: JSON.stringify({ ...result, size: data.length, sha256: sha256Hex(data) }, null, 2) }],
     };

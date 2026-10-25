@@ -5,7 +5,7 @@
 //! ```text
 //! artifacts/<name>/
 //!   current          # current version content
-//!   meta.json        # content_type, timestamps, size, sha256
+//!   meta.json        # rev, content_type, timestamps, size, sha256
 //!   versions/
 //!     2026-10-09T18-22-33-123Z       # previous content
 //!     2026-10-09T18-22-33-123Z.json  # its meta at the time of saving
@@ -19,6 +19,7 @@
 use std::fs;
 use std::io;
 use std::path::PathBuf;
+use std::sync::{Arc, Mutex};
 
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -40,6 +41,12 @@ pub fn valid_name(name: &str) -> bool {
 
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
 pub struct Meta {
+    /// Monotonic mutation counter: 1 on create, +1 on every content-changing
+    /// update and rollback. The optimistic-concurrency token a conditional
+    /// put is checked against; artifacts written before it existed read as 0,
+    /// and their first write gives them a real rev.
+    #[serde(default)]
+    pub rev: u64,
     pub content_type: String,
     pub created_at: String,
     pub updated_at: String,
@@ -71,6 +78,21 @@ pub enum PutOutcome {
     Unchanged,
 }
 
+/// Why a put failed.
+#[derive(Debug)]
+pub enum PutError {
+    /// A conditional put named a rev that is not the current one; nothing was
+    /// written. Carries the current rev.
+    RevConflict { current: u64 },
+    Io(io::Error),
+}
+
+impl From<io::Error> for PutError {
+    fn from(e: io::Error) -> Self {
+        PutError::Io(e)
+    }
+}
+
 #[derive(Debug, PartialEq)]
 pub enum RenameOutcome {
     Renamed(Meta),
@@ -99,13 +121,22 @@ pub struct FileStore {
     collection: &'static str,
     /// Aliases directory under the root; images have no rename, hence none.
     aliases: &'static str,
+    /// Serializes mutations (put / rollback / rename / delete) so a
+    /// conditional put's rev check cannot interleave with another mutation
+    /// of the same artifact.
+    write_lock: Arc<Mutex<()>>,
 }
 
 impl FileStore {
     /// The artifact store: `<root>/artifacts/<name>`, renames tracked in
     /// `<root>/aliases`.
     pub fn new(root: impl Into<PathBuf>) -> io::Result<Self> {
-        let store = FileStore { root: root.into(), collection: "artifacts", aliases: "aliases" };
+        let store = FileStore {
+            root: root.into(),
+            collection: "artifacts",
+            aliases: "aliases",
+            write_lock: Arc::new(Mutex::new(())),
+        };
         fs::create_dir_all(store.collection_root())?;
         fs::create_dir_all(store.aliases_dir())?;
         Ok(store)
@@ -114,9 +145,20 @@ impl FileStore {
     /// The image store shares the data dir but keeps its own namespace,
     /// `<root>/images/<name>`; there is no rename for images, hence no aliases.
     pub fn image_store(root: impl Into<PathBuf>) -> io::Result<Self> {
-        let store = FileStore { root: root.into(), collection: "images", aliases: "image-aliases" };
+        let store = FileStore {
+            root: root.into(),
+            collection: "images",
+            aliases: "image-aliases",
+            write_lock: Arc::new(Mutex::new(())),
+        };
         fs::create_dir_all(store.collection_root())?;
         Ok(store)
+    }
+
+    /// Guard serializing mutations. Poisoning is ignored on purpose: one
+    /// panicking writer must not wedge every later one.
+    fn write_lock(&self) -> std::sync::MutexGuard<'_, ()> {
+        self.write_lock.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
     }
 
     fn collection_root(&self) -> PathBuf {
@@ -172,13 +214,30 @@ impl FileStore {
 
     /// Create or update an artifact. Updating moves the previous `current`
     /// into `versions/`; identical content+type is a no-op. Creating under a
-    /// name that used to redirect drops the redirect.
-    pub fn put(&self, name: &str, content: &[u8], content_type: &str) -> io::Result<PutOutcome> {
+    /// name that used to redirect drops the redirect. With `expect_rev` the
+    /// write applies only when that is the current rev — the check and the
+    /// write share the store's write lock, so a guarded put can never
+    /// interleave with another mutation. Returns the outcome and the meta now
+    /// stored; its `rev` is the token for the next conditional put.
+    pub fn put(
+        &self,
+        name: &str,
+        content: &[u8],
+        content_type: &str,
+        expect_rev: Option<u64>,
+    ) -> Result<(PutOutcome, Meta), PutError> {
+        let _guard = self.write_lock();
         let dir = self.artifact_dir(name);
         if !self.exists(name) {
+            if expect_rev.is_some() {
+                // a conditional put targets a revision; of a missing artifact
+                // the current rev is 0
+                return Err(PutError::RevConflict { current: 0 });
+            }
             fs::create_dir_all(&dir)?;
             self.remove_alias(name);
             let meta = Meta {
+                rev: 1,
                 content_type: content_type.to_string(),
                 created_at: now_rfc3339(),
                 updated_at: now_rfc3339(),
@@ -186,13 +245,18 @@ impl FileStore {
                 sha256: sha256_hex(content),
             };
             atomic_write(&dir.join("current"), content)?;
-            atomic_write(&dir.join("meta.json"), &serde_json::to_vec_pretty(&meta)?)?;
-            return Ok(PutOutcome::Created);
+            atomic_write(&dir.join("meta.json"), &serde_json::to_vec_pretty(&meta).map_err(io::Error::from)?)?;
+            return Ok((PutOutcome::Created, meta));
         }
 
         let old_meta = self.read_meta(name)?;
+        if let Some(expected) = expect_rev {
+            if old_meta.rev != expected {
+                return Err(PutError::RevConflict { current: old_meta.rev });
+            }
+        }
         if old_meta.content_type == content_type && old_meta.sha256 == sha256_hex(content) {
-            return Ok(PutOutcome::Unchanged);
+            return Ok((PutOutcome::Unchanged, old_meta));
         }
 
         let old_content = fs::read(dir.join("current"))?;
@@ -209,10 +273,11 @@ impl FileStore {
         };
         atomic_write(
             &versions.join(format!("{ts}.json")),
-            &serde_json::to_vec_pretty(&version_info)?,
+            &serde_json::to_vec_pretty(&version_info).map_err(io::Error::from)?,
         )?;
 
         let meta = Meta {
+            rev: old_meta.rev + 1,
             content_type: content_type.to_string(),
             created_at: old_meta.created_at,
             updated_at: now_rfc3339(),
@@ -220,8 +285,8 @@ impl FileStore {
             sha256: sha256_hex(content),
         };
         atomic_write(&dir.join("current"), content)?;
-        atomic_write(&dir.join("meta.json"), &serde_json::to_vec_pretty(&meta)?)?;
-        Ok(PutOutcome::Updated)
+        atomic_write(&dir.join("meta.json"), &serde_json::to_vec_pretty(&meta).map_err(io::Error::from)?)?;
+        Ok((PutOutcome::Updated, meta))
     }
 
     pub fn get_current(&self, name: &str) -> io::Result<Option<(Vec<u8>, Meta)>> {
@@ -268,8 +333,10 @@ impl FileStore {
     }
 
     /// Make `version` the current content; the outgoing current is archived
-    /// as a new version entry.
+    /// as a new version entry. A rollback changes the content, so it bumps
+    /// the rev like any other mutation.
     pub fn rollback(&self, name: &str, version: &str) -> io::Result<Option<Meta>> {
+        let _guard = self.write_lock();
         let Some((content, vinfo)) = self.get_version(name, version)? else {
             return Ok(None);
         };
@@ -293,6 +360,7 @@ impl FileStore {
         )?;
 
         let meta = Meta {
+            rev: old_meta.rev + 1,
             content_type: vinfo.content_type,
             created_at: old_meta.created_at,
             updated_at: now_rfc3339(),
@@ -310,6 +378,7 @@ impl FileStore {
     /// same name is a no-op. The old name keeps redirecting to the new one
     /// while the artifact lives there.
     pub fn rename(&self, from: &str, to: &str) -> io::Result<RenameOutcome> {
+        let _guard = self.write_lock();
         if !self.exists(from) {
             return Ok(RenameOutcome::SourceMissing);
         }
@@ -338,6 +407,7 @@ impl FileStore {
     }
 
     pub fn delete(&self, name: &str) -> io::Result<bool> {
+        let _guard = self.write_lock();
         if !self.exists(name) {
             return Ok(false);
         }
@@ -408,12 +478,16 @@ mod tests {
     #[test]
     fn create_read_update_versions() {
         let (_dir, s) = store();
-        assert_eq!(s.put("demo", b"v1", "text/html").unwrap(), PutOutcome::Created);
+        let (outcome, meta) = s.put("demo", b"v1", "text/html", None).unwrap();
+        assert_eq!(outcome, PutOutcome::Created);
+        assert_eq!(meta.rev, 1);
         let (content, meta) = s.get_current("demo").unwrap().unwrap();
         assert_eq!(content, b"v1");
         assert_eq!(meta.content_type, "text/html");
 
-        assert_eq!(s.put("demo", b"v2", "text/html").unwrap(), PutOutcome::Updated);
+        let (outcome, meta) = s.put("demo", b"v2", "text/html", None).unwrap();
+        assert_eq!(outcome, PutOutcome::Updated);
+        assert_eq!(meta.rev, 2);
         let (content, _) = s.get_current("demo").unwrap().unwrap();
         assert_eq!(content, b"v2");
 
@@ -421,17 +495,81 @@ mod tests {
         assert_eq!(versions.len(), 1);
         assert_eq!(versions[0].sha256, sha256_hex(b"v1"));
 
-        // identical content is a no-op, no version churn
-        assert_eq!(s.put("demo", b"v2", "text/html").unwrap(), PutOutcome::Unchanged);
+        // identical content is a no-op, no version churn, rev stays
+        let (outcome, meta) = s.put("demo", b"v2", "text/html", None).unwrap();
+        assert_eq!(outcome, PutOutcome::Unchanged);
+        assert_eq!(meta.rev, 2);
         let (_, versions) = s.get_meta("demo").unwrap().unwrap();
         assert_eq!(versions.len(), 1);
     }
 
     #[test]
-    fn rollback_restores_content() {
+    fn conditional_put_is_guarded_by_rev() {
         let (_dir, s) = store();
-        s.put("demo", b"v1", "text/html").unwrap();
-        s.put("demo", b"v2", "text/html").unwrap();
+
+        // a conditional put on a missing artifact conflicts with rev 0
+        match s.put("nope", b"x", "text/html", Some(0)) {
+            Err(PutError::RevConflict { current }) => assert_eq!(current, 0),
+            other => panic!("expected a rev conflict, got {other:?}"),
+        }
+        assert!(!s.exists("nope"));
+
+        let (_, meta) = s.put("demo", b"v1", "text/html", None).unwrap();
+        assert_eq!(meta.rev, 1);
+
+        // matching rev updates and bumps
+        let (outcome, meta) = s.put("demo", b"v2", "text/html", Some(1)).unwrap();
+        assert_eq!(outcome, PutOutcome::Updated);
+        assert_eq!(meta.rev, 2);
+
+        // stale rev is a conflict carrying the current one; nothing written
+        match s.put("demo", b"v3", "text/html", Some(1)) {
+            Err(PutError::RevConflict { current }) => assert_eq!(current, 2),
+            other => panic!("expected a rev conflict, got {other:?}"),
+        }
+        let (content, meta) = s.get_current("demo").unwrap().unwrap();
+        assert_eq!(content, b"v2");
+        assert_eq!(meta.rev, 2);
+        let (_, versions) = s.get_meta("demo").unwrap().unwrap();
+        assert_eq!(versions.len(), 1);
+
+        // matching rev with identical content is Unchanged, rev stays
+        let (outcome, meta) = s.put("demo", b"v2", "text/html", Some(2)).unwrap();
+        assert_eq!(outcome, PutOutcome::Unchanged);
+        assert_eq!(meta.rev, 2);
+    }
+
+    #[test]
+    fn legacy_meta_without_rev_defaults_to_zero_and_migrates() {
+        let (dir, s) = store();
+        let art = dir.path().join("artifacts").join("legacy");
+        fs::create_dir_all(&art).unwrap();
+        fs::write(art.join("current"), b"old").unwrap();
+        let legacy = format!(
+            r#"{{"content_type":"text/html","created_at":"2026-01-01T00:00:00Z","updated_at":"2026-01-01T00:00:00Z","size":3,"sha256":"{}"}}"#,
+            sha256_hex(b"old")
+        );
+        fs::write(art.join("meta.json"), legacy).unwrap();
+
+        // reads as rev 0, so a conditional update expecting 0 applies
+        let (meta, _) = s.get_meta("legacy").unwrap().unwrap();
+        assert_eq!(meta.rev, 0);
+        let (outcome, meta) = s.put("legacy", b"new", "text/html", Some(0)).unwrap();
+        assert_eq!(outcome, PutOutcome::Updated);
+        assert_eq!(meta.rev, 1);
+
+        // and the next writer sees the real rev
+        match s.put("legacy", b"x", "text/html", Some(0)) {
+            Err(PutError::RevConflict { current }) => assert_eq!(current, 1),
+            other => panic!("expected a rev conflict, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn rollback_restores_content_and_bumps_rev() {
+        let (_dir, s) = store();
+        s.put("demo", b"v1", "text/html", None).unwrap();
+        s.put("demo", b"v2", "text/html", None).unwrap();
         let (_, versions) = s.get_meta("demo").unwrap().unwrap();
         let first = versions[0].version.clone();
 
@@ -439,6 +577,7 @@ mod tests {
         let (content, _) = s.get_current("demo").unwrap().unwrap();
         assert_eq!(content, b"v1");
         assert_eq!(meta.created_at, s.read_meta("demo").unwrap().created_at);
+        assert_eq!(meta.rev, 3);
 
         // rollback archived the outgoing current
         let (_, versions) = s.get_meta("demo").unwrap().unwrap();
@@ -448,9 +587,9 @@ mod tests {
     #[test]
     fn rename_keeps_content_history_and_timestamps() {
         let (_dir, s) = store();
-        s.put("demo", b"v1", "text/html").unwrap();
-        s.put("demo", b"v2", "text/html").unwrap();
-        s.put("taken", b"x", "text/plain").unwrap();
+        s.put("demo", b"v1", "text/html", None).unwrap();
+        s.put("demo", b"v2", "text/html", None).unwrap();
+        s.put("taken", b"x", "text/plain", None).unwrap();
         let (_, created_at) = s.get_current("demo").unwrap().unwrap();
         let created_at = created_at.created_at;
 
@@ -476,7 +615,7 @@ mod tests {
     #[test]
     fn rename_leaves_a_followable_redirect() {
         let (_dir, s) = store();
-        s.put("a", b"v1", "text/html").unwrap();
+        s.put("a", b"v1", "text/html", None).unwrap();
         s.rename("a", "b").unwrap();
         assert_eq!(s.resolve_alias("a").unwrap().as_deref(), Some("b"));
         assert_eq!(s.resolve_alias("b").unwrap(), None);
@@ -493,16 +632,16 @@ mod tests {
         assert_eq!(s.resolve_alias("c").unwrap().as_deref(), Some("a"));
 
         // recreating a name replaces its redirect with the artifact
-        s.put("c", b"reincarnated", "text/html").unwrap();
+        s.put("c", b"reincarnated", "text/html", None).unwrap();
         assert_eq!(s.resolve_alias("c").unwrap(), None);
     }
 
     #[test]
     fn list_with_prefix_and_delete() {
         let (_dir, s) = store();
-        s.put("report-a", b"1", "text/plain").unwrap();
-        s.put("report-b", b"22", "text/plain").unwrap();
-        s.put("other", b"3", "text/plain").unwrap();
+        s.put("report-a", b"1", "text/plain", None).unwrap();
+        s.put("report-b", b"22", "text/plain", None).unwrap();
+        s.put("other", b"3", "text/plain", None).unwrap();
 
         let all = s.list("").unwrap();
         assert_eq!(all.len(), 3);
@@ -529,8 +668,8 @@ mod tests {
     fn image_store_is_a_separate_namespace() {
         let (dir, s) = store();
         let images = FileStore::image_store(dir.path()).unwrap();
-        s.put("x-dup", b"page", "text/html").unwrap();
-        images.put("x-dup", b"png-bytes", "image/png").unwrap();
+        s.put("x-dup", b"page", "text/html", None).unwrap();
+        images.put("x-dup", b"png-bytes", "image/png", None).unwrap();
 
         let (content, meta) = images.get_current("x-dup").unwrap().unwrap();
         assert_eq!(content, b"png-bytes");
