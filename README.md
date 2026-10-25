@@ -20,6 +20,13 @@ files on its own filesystem, plus an MCP server for AI agents to work with them.
   listing and never will be — artifact names are only visible with the token.
 - Updates archive the previous version (`versions/<timestamp>`), so anything can
   be rolled back.
+- **Optimistic concurrency**: every artifact and image carries a `rev` — 1 on
+  create, +1 on every content-changing update and rollback. A PUT with
+  `X-Expected-Rev: <n>` applies only when `n` is the current rev and answers 409
+  with the current one otherwise; the check and the write are serialized under a
+  single write lock, so a guarded write can never interleave with another
+  mutation. Parallel agents pass the rev they read and, on a conflict, refetch
+  the artifact and re-apply their changes on top.
 
 Artifact and image names must match `^[a-z0-9][a-z0-9-]{0,63}$` — one safe path component.
 Artifacts and images are two independent namespaces: the same name can exist in both,
@@ -36,16 +43,16 @@ rollback for images — replace with an update or delete and re-upload.
 | GET | `/i/{name}` | public; current image bytes |
 | GET | `/healthz` | public; for kamal-proxy |
 | GET | `/api/artifacts?prefix=` | list: name, content type, size, updated_at |
-| GET | `/api/artifacts/{name}` | meta + version history + public URL |
+| GET | `/api/artifacts/{name}` | meta (incl. `rev`) + version history + public URL |
 | GET | `/api/artifacts/{name}/content` | raw current bytes with the stored content type — unlike the public `GET /a/{name}`, text/html is served without the injected live-reload script |
-| PUT | `/api/artifacts/{name}` | body = content; `X-Create-Only: true` → 409 if exists; `X-Update-Only: true` → 404 if missing; otherwise upsert. Content type taken from the request `Content-Type` |
+| PUT | `/api/artifacts/{name}` | body = content; `X-Create-Only: true` → 409 if exists; `X-Update-Only: true` → 404 if missing; otherwise upsert. `X-Expected-Rev: <n>` → the write applies only if `n` is the current rev, else 409 naming the current one. Every response carries the stored `rev`. Content type taken from the request `Content-Type` |
 | GET | `/api/artifacts/{name}/versions/{version}` | download a specific version |
 | POST | `/api/artifacts/{name}/rollback/{version}` | make a version current (outgoing current is archived) |
 | POST | `/api/artifacts/{name}/rename/{new}` | atomic move; 409 if the target name exists; content, history and timestamps are preserved; the old URL answers with a 302 redirect (aliases follow further renames; recreating a name drops its redirect) |
 | DELETE | `/api/artifacts/{name}` | remove the artifact with all versions |
 | GET | `/api/images?prefix=` | list uploaded images |
-| GET | `/api/images/{name}` | meta + version history + public image URL |
-| PUT | `/api/images/{name}` | body = image bytes; request `Content-Type` must be `image/*` (parameters are stripped), else 415; same `X-Create-Only` / `X-Update-Only` semantics as artifacts. Response carries the public URL (`/i/<name>`), content type, size and sha256 |
+| GET | `/api/images/{name}` | meta (incl. `rev`) + version history + public image URL |
+| PUT | `/api/images/{name}` | body = image bytes; request `Content-Type` must be `image/*` (parameters are stripped), else 415; same `X-Create-Only` / `X-Update-Only` / `X-Expected-Rev` semantics as artifacts. Response carries the public URL (`/i/<name>`), content type, size, sha256 and rev |
 | DELETE | `/api/images/{name}` | remove the image with all versions |
 
 ## Configuration (env)
@@ -63,7 +70,7 @@ rollback for images — replace with an update or delete and re-upload.
 ```
 <data>/artifacts/<name>/
   current              # current version content
-  meta.json            # content_type, created_at, updated_at, size, sha256
+  meta.json            # rev, content_type, created_at, updated_at, size, sha256
   versions/2026-10-09T18-22-33-123Z       # archived content
   versions/2026-10-09T18-22-33-123Z.json  # its meta at save time
 <data>/images/<name>/  # same structure, image namespace (no rename, no aliases)
@@ -86,6 +93,11 @@ current content to a local file (default `<tmpdir>/artifacts/<name>.<ext>`,
 override with `filePath`) and returns metadata plus the path; `save_artifact` /
 `update_artifact` take either an inline `content` string or a `filePath` to
 upload from — the edit loop is get → edit the file → update with `filePath`.
+`update_artifact` also takes `expectedRev` — the rev from the `get_artifact`,
+`save_artifact` or previous `update_artifact` result. When another agent updated
+the artifact in between, the update fails with a version conflict and nothing is
+written: re-read the artifact and re-apply the changes on top of the fresh
+content, then update again with the new rev.
 It uses `GET /api/artifacts/{name}/content` for raw bytes and falls back to the
 public route on older servers, flagging injected-script content with a `warning`.
 
