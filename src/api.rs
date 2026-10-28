@@ -74,6 +74,7 @@ pub fn router(state: SharedState, max_body: usize) -> Router {
         .route("/api/artifacts/{name}/rename/{new_name}", post(rename_artifact))
         .route("/api/images", get(list_images))
         .route("/api/images/{name}", get(get_image_meta).put(put_image).delete(delete_image))
+        .route("/api/images/batch", post(batch_put_images))
         .fallback(not_found)
         .layer(axum::extract::DefaultBodyLimit::max(max_body))
         .with_state(state)
@@ -711,10 +712,109 @@ async fn delete_image(State(state): State<SharedState>, _auth: Authed, Path(name
     }
 }
 
+// --- images: batch upload ---
+
+const BATCH_MAX_ITEMS: usize = 50;
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct BatchImageItem {
+    name: String,
+    /// Raw image bytes, base64.
+    content: String,
+    /// Required — the API has no file extension or HTTP response to infer from.
+    content_type: String,
+}
+
+#[derive(Deserialize)]
+struct BatchImages {
+    /// false (default): create-only, an existing name is a per-item error;
+    /// true: create or replace, the previous version is archived.
+    #[serde(default)]
+    replace: bool,
+    images: Vec<BatchImageItem>,
+}
+
+/// Batch image upload: one request, per-item results. Structural problems
+/// (bad JSON, wrong shape, too many items) fail the whole request with 400;
+/// anything specific to one image (invalid name, non-image content type,
+/// existing name without `replace`) fails only that item — the answer is 200
+/// and the other images still land. Results keep the request order, so a
+/// client can retry exactly the failed rows.
+async fn batch_put_images(State(state): State<SharedState>, _auth: Authed, body: axum::body::Bytes) -> Response {
+    let batch: BatchImages = match serde_json::from_slice(&body) {
+        Ok(batch) => batch,
+        Err(e) => return error_response(StatusCode::BAD_REQUEST, &format!("invalid batch body: {e}")),
+    };
+    if batch.images.is_empty() {
+        return error_response(StatusCode::BAD_REQUEST, "images must be a non-empty array");
+    }
+    if batch.images.len() > BATCH_MAX_ITEMS {
+        return error_response(
+            StatusCode::BAD_REQUEST,
+            &format!("at most {BATCH_MAX_ITEMS} images per batch"),
+        );
+    }
+
+    let mut results = Vec::with_capacity(batch.images.len());
+    for item in &batch.images {
+        match batch_item_outcome(&state, item, batch.replace) {
+            Ok(row) => results.push(row),
+            Err(message) => results.push(serde_json::json!({ "name": item.name, "error": message })),
+        }
+    }
+    let uploaded = results.iter().filter(|row| row.get("url").is_some()).count();
+    let body = serde_json::json!({
+        "uploaded": uploaded,
+        "failed": results.len() - uploaded,
+        "results": results,
+    });
+    (StatusCode::OK, Json(body)).into_response()
+}
+
+/// Decode, validate and store one batch item; the error string goes into the
+/// per-item `error` field.
+fn batch_item_outcome(
+    state: &SharedState,
+    item: &BatchImageItem,
+    replace: bool,
+) -> Result<serde_json::Value, String> {
+    use base64::Engine as _;
+    if !crate::store::valid_name(&item.name) {
+        return Err(format!("invalid name: {NAME_RULE}"));
+    }
+    let bare = item.content_type.split(';').next().unwrap_or("").trim().to_ascii_lowercase();
+    if !bare.starts_with("image/") {
+        return Err(format!("contentType must be image/*, got \"{}\"", item.content_type));
+    }
+    let bytes = base64::engine::general_purpose::STANDARD
+        .decode(&item.content)
+        .map_err(|_| "content is empty or not valid base64".to_string())?;
+    if bytes.is_empty() {
+        return Err("content is empty or not valid base64".to_string());
+    }
+    if !replace && state.images.exists(&item.name) {
+        return Err("image already exists (pass replace: true to overwrite)".to_string());
+    }
+    match state.images.put(&item.name, &bytes, &bare, None) {
+        Ok((outcome, meta)) => Ok(serde_json::json!({
+            "name": item.name,
+            "url": public_url(state, "i", &item.name),
+            "content_type": meta.content_type,
+            "size": meta.size,
+            "sha256": meta.sha256,
+            "created": matches!(outcome, PutOutcome::Created),
+        })),
+        Err(PutError::RevConflict { .. }) => Err("unexpected rev conflict in batch put".to_string()),
+        Err(PutError::Io(e)) => Err(format!("storage error: {e}")),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use axum::http::Request;
+    use base64::Engine as _;
     use http_body_util::BodyExt;
     use sha2::Digest;
     use tower::ServiceExt;
@@ -782,6 +882,7 @@ mod tests {
             (axum::http::Method::GET, "/api/images/x-shot"),
             (axum::http::Method::PUT, "/api/images/x-shot"),
             (axum::http::Method::DELETE, "/api/images/x-shot"),
+            (axum::http::Method::POST, "/api/images/batch"),
         ] {
             let req = Request::builder().method(method).uri(path).body(Body::empty()).unwrap();
             let (status, _, _) = send(&app, req).await;
@@ -1078,6 +1179,112 @@ mod tests {
         assert_eq!(status, StatusCode::NO_CONTENT);
         let (status, _, _) = send(&app, Request::get("/i/x-shot").body(Body::empty()).unwrap()).await;
         assert_eq!(status, StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn batch_image_upload() {
+        let dir = tempfile::tempdir().unwrap();
+        let app = router(test_state(dir.path()), 10 * 1024 * 1024);
+        let png = vec![0x89, b'P', b'N', b'G', 1, 2, 3];
+        let encoded = base64::engine::general_purpose::STANDARD.encode(&png);
+
+        // happy path: two images in one request, results keep the request order
+        let batch = serde_json::json!({
+            "images": [
+                { "name": "x-b-one", "content": encoded, "contentType": "image/png" },
+                { "name": "x-b-two", "content": base64::engine::general_purpose::STANDARD.encode(b"gif"), "contentType": "image/gif" },
+            ],
+        });
+        let req = Request::post("/api/images/batch")
+            .header(header::AUTHORIZATION, "Bearer secret-token")
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(serde_json::to_vec(&batch).unwrap()))
+            .unwrap();
+        let (status, body, ct) = send(&app, req).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(ct.as_deref(), Some("application/json"));
+        let batch: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(batch["uploaded"], 2);
+        assert_eq!(batch["failed"], 0);
+        assert_eq!(batch["results"][0]["url"], "https://artifacts.example.com/i/x-b-one");
+        assert_eq!(batch["results"][0]["created"], true);
+        assert_eq!(batch["results"][0]["size"], png.len());
+        assert_eq!(batch["results"][0]["sha256"], hex::encode(sha2::Sha256::digest(&png)));
+        let (status, body, _) = send(&app, Request::get("/i/x-b-two").body(Body::empty()).unwrap()).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body, b"gif");
+
+        // per-item failures don't sink the rest: duplicate name, invalid name,
+        // non-image type, broken base64
+        let batch = serde_json::json!({
+            "images": [
+                { "name": "x-b-one", "content": encoded, "contentType": "image/png" },
+                { "name": "Bad_Name", "content": encoded, "contentType": "image/png" },
+                { "name": "x-b-html", "content": encoded, "contentType": "text/html" },
+                { "name": "x-b-b64", "content": "!!!not base64!!!", "contentType": "image/png" },
+                { "name": "x-b-three", "content": encoded, "contentType": "image/png" },
+            ],
+        });
+        let req = Request::post("/api/images/batch")
+            .header(header::AUTHORIZATION, "Bearer secret-token")
+            .body(Body::from(serde_json::to_vec(&batch).unwrap()))
+            .unwrap();
+        let (status, body, _) = send(&app, req).await;
+        assert_eq!(status, StatusCode::OK);
+        let batch: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(batch["uploaded"], 1);
+        assert_eq!(batch["failed"], 4);
+        let results = batch["results"].as_array().unwrap();
+        assert!(results[0]["error"].as_str().unwrap().contains("already exists"));
+        assert!(results[1]["error"].as_str().unwrap().contains("invalid name"));
+        assert!(results[2]["error"].as_str().unwrap().contains("image/*"));
+        assert!(results[3]["error"].as_str().unwrap().contains("base64"));
+        assert_eq!(results[4]["url"], "https://artifacts.example.com/i/x-b-three");
+
+        // replace: true overwrites the duplicate instead of erroring
+        let batch = serde_json::json!({
+            "replace": true,
+            "images": [
+                { "name": "x-b-one", "content": base64::engine::general_purpose::STANDARD.encode(b"v2"), "contentType": "image/png" },
+            ],
+        });
+        let req = Request::post("/api/images/batch")
+            .header(header::AUTHORIZATION, "Bearer secret-token")
+            .body(Body::from(serde_json::to_vec(&batch).unwrap()))
+            .unwrap();
+        let (status, body, _) = send(&app, req).await;
+        assert_eq!(status, StatusCode::OK);
+        let batch: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(batch["uploaded"], 1);
+        assert_eq!(batch["results"][0]["created"], false);
+        let (_, body, _) = send(&app, Request::get("/i/x-b-one").body(Body::empty()).unwrap()).await;
+        assert_eq!(body, b"v2");
+
+        // structural problems fail the whole request with 400
+        for broken in [
+            serde_json::json!({ "images": [] }),
+            serde_json::json!({ "images": "two" }),
+            serde_json::json!({ "replace": false }),
+            serde_json::json!(null),
+        ] {
+            let req = Request::post("/api/images/batch")
+                .header(header::AUTHORIZATION, "Bearer secret-token")
+                .body(Body::from(serde_json::to_vec(&broken).unwrap()))
+                .unwrap();
+            let (status, _, _) = send(&app, req).await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{broken}");
+        }
+
+        // more items than the cap is 400 too
+        let many: Vec<serde_json::Value> = (0..51)
+            .map(|i| serde_json::json!({ "name": format!("x-b-{i}"), "content": encoded, "contentType": "image/png" }))
+            .collect();
+        let req = Request::post("/api/images/batch")
+            .header(header::AUTHORIZATION, "Bearer secret-token")
+            .body(Body::from(serde_json::to_vec(&serde_json::json!({ "images": many })).unwrap()))
+            .unwrap();
+        let (status, _, _) = send(&app, req).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
     }
 
     #[tokio::test]
