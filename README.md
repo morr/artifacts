@@ -4,8 +4,10 @@ Tiny artifact storage: a Rust web server (single static musl binary) that stores
 files on its own filesystem, plus an MCP server for AI agents to work with them.
 
 - **Public** (no auth): `GET /a/<name>` — serves the current version of an
-  artifact with its stored content type (HTML renders in a browser); `GET /i/<name>` —
-  serves an uploaded image the same way; `GET /healthz`.
+  artifact with its stored content type (HTML renders in a browser); `GET /i/<name>.<ext>` —
+  serves an uploaded image the same way (the extension is decoration: the stored
+  name never contains dots, so whatever follows the first dot is stripped; the
+  bare `/i/<name>` keeps serving for links already published); `GET /healthz`.
   A renamed artifact keeps answering on its old URL with a 302 redirect to the
   new name, as long as nothing was created under the old name since.
 - **Live reload**: served HTML pages carry a tiny injected script holding a
@@ -52,7 +54,7 @@ rollback for images — replace with an update or delete and re-upload.
 | DELETE | `/api/artifacts/{name}` | remove the artifact with all versions |
 | GET | `/api/images?prefix=` | list uploaded images |
 | GET | `/api/images/{name}` | meta (incl. `rev`) + version history + public image URL |
-| PUT | `/api/images/{name}` | body = image bytes; request `Content-Type` must be `image/*` (parameters are stripped), else 415; same `X-Create-Only` / `X-Update-Only` / `X-Expected-Rev` semantics as artifacts. Response carries the public URL (`/i/<name>`), content type, size, sha256 and rev |
+| PUT | `/api/images/{name}` | body = image bytes; request `Content-Type` must be `image/*` (parameters are stripped), else 415; same `X-Create-Only` / `X-Update-Only` / `X-Expected-Rev` semantics as artifacts. Response carries the public URL (`/i/<name>.<ext>`, the canonical extension of the content type — png, jpg, svg, …; unknown types keep the bare name), content type, size, sha256 and rev |
 | POST | `/api/images/batch` | body = JSON `{"replace": false, "images": [{"name", "content" (base64), "contentType"}]}`; up to 50 images and one `ARTIFACTS_MAX_BODY` worth of bytes per call. Structural problems (bad JSON, empty or oversized array) are 400; anything specific to one image — invalid name, non-image `contentType`, existing name without `replace` — fails only that item, and the structurally valid answer is 200 with `{"uploaded", "failed", "results"}` in the request order (each row either the usual image body or `{"name", "error"}`) |
 | DELETE | `/api/images/{name}` | remove the image with all versions |
 
@@ -88,8 +90,10 @@ TypeScript MCP server over stdio with tools `list_artifacts`, `get_artifact`,
 `upload_image` / `update_image` (sources: local `filePath`, `sourceUrl` or
 `contentBase64`), the batch `upload_images` (same per-item sources, per-item
 results — the alternative to N single calls when several images go into one
-page), `list_images`, `delete_image`. Responses include the public URL
-(`/a/<name>`, images `/i/<name>`) so an agent can hand the link straight to the user.
+page), `get_image` (writes the current image bytes to a local file — metadata
+and path only, like `get_artifact`), `list_images`, `delete_image`. Responses
+include the public URL (`/a/<name>`, images `/i/<name>.<ext>`) so an agent can
+hand the link straight to the user.
 
 Large content never passes through the model context: `get_artifact` writes the
 current content to a local file (default `<tmpdir>/artifacts/<name>.<ext>`,

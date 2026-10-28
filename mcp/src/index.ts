@@ -3,8 +3,8 @@
  * MCP server for the artifacts storage (https://github.com/morr/artifacts).
  *
  * Tools: list/get/save/update artifacts, list versions, rollback, rename, delete;
- * plus image tools: upload/update/list/delete images (public URLs `/i/<name>`
- * for embedding into artifacts).
+ * plus image tools: get (download to a file), upload/update/list/delete images
+ * (public URLs `/i/<name>` for embedding into artifacts).
  * Reads ARTIFACTS_BASE_URL and ARTIFACTS_TOKEN from the environment;
  * all tool failures come back as isError results with a readable message.
  */
@@ -91,6 +91,17 @@ const EXTENSIONS_BY_CONTENT_TYPE: Record<string, string> = {
 function defaultArtifactPath(name: string, contentType: string): string {
   const bare = contentType.split(";")[0].trim().toLowerCase();
   return join(tmpdir(), "artifacts", `${name}${EXTENSIONS_BY_CONTENT_TYPE[bare] ?? ".bin"}`);
+}
+
+// The inverse map for get_image's default download path: stored content type
+// → file extension, matching the extension the server appends to /i/ URLs.
+const EXTENSIONS_BY_IMAGE_TYPE: Record<string, string> = Object.fromEntries(
+  Object.entries(IMAGE_TYPES_BY_EXT).map(([ext, ct]) => [ct, ext]),
+);
+
+function defaultImagePath(name: string, contentType: string): string {
+  const bare = contentType.split(";")[0].trim().toLowerCase();
+  return join(tmpdir(), "artifacts", `${name}${EXTENSIONS_BY_IMAGE_TYPE[bare] ?? ".bin"}`);
 }
 
 // Content for save/update: exactly one of an inline string or a local file.
@@ -249,7 +260,7 @@ async function putImage(
   return { content: [{ type: "text" as const, text: JSON.stringify(result, null, 2) }] };
 }
 
-const server = new McpServer({ name: "artifacts", version: "0.5.0" });
+const server = new McpServer({ name: "artifacts", version: "0.6.0" });
 
 server.registerTool(
   "list_artifacts",
@@ -325,6 +336,54 @@ server.registerTool(
       versionCount: meta.versions.length,
       path,
       ...(warning ? { warning } : {}),
+    };
+    return { content: [{ type: "text", text: JSON.stringify(result, null, 2) }] };
+  },
+);
+
+server.registerTool(
+  "get_image",
+  {
+    title: "Get image",
+    description:
+      "Download the current bytes of an image to a local file (default <tmpdir>/artifacts/<name>.<ext>, " +
+      "override with filePath — it is overwritten); the result carries only metadata plus the path, never " +
+      "the bytes themselves. Read the file with file tools or hand it to a vision tool. The reading " +
+      "counterpart of upload_image: use it to inspect what an artifact embeds by its /i/<name> URL, instead " +
+      "of fetching that URL over raw HTTP.",
+    inputSchema: {
+      name: z.string().describe(`Image name, ${NAME_RULE}`),
+      filePath: z.string().optional().describe("Local file to write the bytes to; default <tmpdir>/artifacts/<name>.<ext>"),
+    },
+  },
+  async ({ name, filePath }) => {
+    const c = config();
+    assertName(name);
+    const meta = await fetchImageMeta(c, name);
+    // The public /i/ route serves the raw stored bytes (no live-reload
+    // injection — that only touches artifact HTML), so the stored sha256 must
+    // match what came back.
+    const resp = await fetch(`${c.baseUrl}/i/${name}`);
+    if (!resp.ok) throw new ToolError(`artifacts API ${resp.status} ${resp.statusText}`);
+    const buf = Buffer.from(await resp.arrayBuffer());
+    if (buf.length === 0) throw new ToolError(`artifacts API returned an empty body for /i/${name}`);
+    const sha256 = sha256Hex(buf);
+    const path = filePath ?? defaultImagePath(name, meta.meta.content_type);
+    await mkdir(dirname(path), { recursive: true });
+    await writeFile(path, buf);
+    const result = {
+      name,
+      url: meta.url,
+      rev: meta.meta.rev,
+      contentType: meta.meta.content_type,
+      size: buf.length,
+      sha256,
+      updatedAt: meta.meta.updated_at,
+      versionCount: meta.versions.length,
+      path,
+      ...(sha256 !== meta.meta.sha256
+        ? { warning: `sha256 mismatch: stored ${meta.meta.sha256}, downloaded ${sha256}` }
+        : {}),
     };
     return { content: [{ type: "text", text: JSON.stringify(result, null, 2) }] };
   },

@@ -117,6 +117,29 @@ fn public_url(state: &SharedState, kind: &str, name: &str) -> String {
     format!("{}/{}/{}", state.public_base.trim_end_matches('/'), kind, name)
 }
 
+/// Canonical file extension for an image content type; unknown types get none.
+fn image_ext(content_type: &str) -> Option<&'static str> {
+    match content_type.split(';').next()?.trim().to_ascii_lowercase().as_str() {
+        "image/png" => Some("png"),
+        "image/jpeg" => Some("jpg"),
+        "image/gif" => Some("gif"),
+        "image/webp" => Some("webp"),
+        "image/avif" => Some("avif"),
+        "image/svg+xml" => Some("svg"),
+        _ => None,
+    }
+}
+
+/// Public image URLs carry a file extension (`/i/<name>.png`) so links read as
+/// images; unknown content types fall back to the bare name. `/i/<name>`
+/// without an extension keeps serving for the URLs already published.
+fn image_public_url(state: &SharedState, name: &str, content_type: &str) -> String {
+    match image_ext(content_type) {
+        Some(ext) => format!("{}/i/{}.{}", state.public_base.trim_end_matches('/'), name, ext),
+        None => public_url(state, "i", name),
+    }
+}
+
 // --- validation ---
 
 fn bad_name(name: &str) -> Option<Response> {
@@ -583,10 +606,13 @@ async fn delete_artifact(State(state): State<SharedState>, _auth: Authed, Path(n
 
 /// Images keep their own namespace and public path: `/i/{name}`.
 async fn get_image_public(State(state): State<SharedState>, Path(name): Path<String>) -> Response {
-    if !crate::store::valid_name(&name) {
+    // /i/<name>.<ext> and /i/<name> both serve the image; stored names never
+    // contain dots, so the first dot starts a client-added extension.
+    let name = name.split('.').next().unwrap_or("");
+    if !crate::store::valid_name(name) {
         return not_found().await;
     }
-    match state.images.get_current(&name) {
+    match state.images.get_current(name) {
         Ok(Some((content, meta))) => build_content_response(content, &meta.content_type),
         Ok(None) => not_found().await,
         Err(e) => storage_error(e),
@@ -608,7 +634,7 @@ async fn get_image_meta(State(state): State<SharedState>, _auth: Authed, Path(na
         Ok(Some((meta, versions))) => {
             let body = serde_json::json!({
                 "name": name,
-                "url": public_url(&state, "i", &name),
+                "url": image_public_url(&state, &name, &meta.content_type),
                 "meta": meta,
                 "versions": versions,
             });
@@ -630,7 +656,7 @@ fn image_content_type(headers: &HeaderMap) -> Option<String> {
 fn image_body(state: &SharedState, name: &str, created: bool, meta: &Meta) -> serde_json::Value {
     serde_json::json!({
         "name": name,
-        "url": public_url(state, "i", name),
+        "url": image_public_url(state, name, &meta.content_type),
         "content_type": meta.content_type,
         "size": meta.size,
         "sha256": meta.sha256,
@@ -799,7 +825,7 @@ fn batch_item_outcome(
     match state.images.put(&item.name, &bytes, &bare, None) {
         Ok((outcome, meta)) => Ok(serde_json::json!({
             "name": item.name,
-            "url": public_url(state, "i", &item.name),
+            "url": image_public_url(state, &item.name, &bare),
             "content_type": meta.content_type,
             "size": meta.size,
             "sha256": meta.sha256,
@@ -1095,7 +1121,7 @@ mod tests {
         .await;
         assert_eq!(status, StatusCode::CREATED, "{}", String::from_utf8_lossy(&body));
         let created: serde_json::Value = serde_json::from_slice(&body).unwrap();
-        assert_eq!(created["url"], "https://artifacts.example.com/i/x-shot");
+        assert_eq!(created["url"], "https://artifacts.example.com/i/x-shot.png");
         assert_eq!(created["content_type"], "image/png");
         assert_eq!(created["size"], png.len());
         assert_eq!(created["sha256"], hex::encode(sha2::Sha256::digest(&png)));
@@ -1148,7 +1174,7 @@ mod tests {
         let (status, body, _) = send(&app, req).await;
         assert_eq!(status, StatusCode::OK);
         let meta: serde_json::Value = serde_json::from_slice(&body).unwrap();
-        assert_eq!(meta["url"], "https://artifacts.example.com/i/x-shot");
+        assert_eq!(meta["url"], "https://artifacts.example.com/i/x-shot.png");
         assert_eq!(meta["versions"].as_array().unwrap().len(), 1);
         assert_eq!(meta["versions"][0]["sha256"], hex::encode(sha2::Sha256::digest(&png)));
 
@@ -1182,6 +1208,50 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn image_url_extensions() {
+        let dir = tempfile::tempdir().unwrap();
+        let app = router(test_state(dir.path()), 10 * 1024 * 1024);
+
+        // the public URL gains the canonical extension of the content type
+        // (parameters stripped); a type without a canonical one keeps the bare name
+        let cases = [
+            ("x-e-png", "image/png", "https://artifacts.example.com/i/x-e-png.png"),
+            ("x-e-jpg", "image/jpeg; charset=binary", "https://artifacts.example.com/i/x-e-jpg.jpg"),
+            ("x-e-svg", "image/svg+xml", "https://artifacts.example.com/i/x-e-svg.svg"),
+            ("x-e-tiff", "image/tiff", "https://artifacts.example.com/i/x-e-tiff"),
+        ];
+        for (name, ct, url) in cases {
+            let (status, body, _) = send(
+                &app,
+                auth_put_image(name, ct, b"img".to_vec(), &[("x-create-only", "true")]),
+            )
+            .await;
+            assert_eq!(status, StatusCode::CREATED, "{}", String::from_utf8_lossy(&body));
+            let created: serde_json::Value = serde_json::from_slice(&body).unwrap();
+            assert_eq!(created["url"], url);
+
+            // the extensioned path serves the same bytes as the bare one
+            let path: axum::http::Uri = url
+                .trim_start_matches("https://artifacts.example.com")
+                .parse()
+                .unwrap();
+            let bare: axum::http::Uri = format!("/i/{name}").parse().unwrap();
+            for get in [path, bare] {
+                let (status, _, served) = send(&app, Request::get(get).body(Body::empty()).unwrap()).await;
+                assert_eq!(status, StatusCode::OK);
+                assert_eq!(served.as_deref(), Some(ct.split(';').next().unwrap()));
+            }
+        }
+
+        // the extension is decoration: even a wrong one still serves the image,
+        // while an all-extension path is just a missing name
+        let (status, _, _) = send(&app, Request::get("/i/x-e-png.webp").body(Body::empty()).unwrap()).await;
+        assert_eq!(status, StatusCode::OK);
+        let (status, _, _) = send(&app, Request::get("/i/.png").body(Body::empty()).unwrap()).await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
     async fn batch_image_upload() {
         let dir = tempfile::tempdir().unwrap();
         let app = router(test_state(dir.path()), 10 * 1024 * 1024);
@@ -1206,11 +1276,12 @@ mod tests {
         let batch: serde_json::Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(batch["uploaded"], 2);
         assert_eq!(batch["failed"], 0);
-        assert_eq!(batch["results"][0]["url"], "https://artifacts.example.com/i/x-b-one");
+        assert_eq!(batch["results"][0]["url"], "https://artifacts.example.com/i/x-b-one.png");
         assert_eq!(batch["results"][0]["created"], true);
         assert_eq!(batch["results"][0]["size"], png.len());
         assert_eq!(batch["results"][0]["sha256"], hex::encode(sha2::Sha256::digest(&png)));
-        let (status, body, _) = send(&app, Request::get("/i/x-b-two").body(Body::empty()).unwrap()).await;
+        assert_eq!(batch["results"][1]["url"], "https://artifacts.example.com/i/x-b-two.gif");
+        let (status, body, _) = send(&app, Request::get("/i/x-b-two.gif").body(Body::empty()).unwrap()).await;
         assert_eq!(status, StatusCode::OK);
         assert_eq!(body, b"gif");
 
@@ -1239,7 +1310,7 @@ mod tests {
         assert!(results[1]["error"].as_str().unwrap().contains("invalid name"));
         assert!(results[2]["error"].as_str().unwrap().contains("image/*"));
         assert!(results[3]["error"].as_str().unwrap().contains("base64"));
-        assert_eq!(results[4]["url"], "https://artifacts.example.com/i/x-b-three");
+        assert_eq!(results[4]["url"], "https://artifacts.example.com/i/x-b-three.png");
 
         // replace: true overwrites the duplicate instead of erroring
         let batch = serde_json::json!({
