@@ -53,6 +53,7 @@ rollback for images — replace with an update or delete and re-upload.
 | GET | `/api/images?prefix=` | list uploaded images |
 | GET | `/api/images/{name}` | meta (incl. `rev`) + version history + public image URL |
 | PUT | `/api/images/{name}` | body = image bytes; request `Content-Type` must be `image/*` (parameters are stripped), else 415; same `X-Create-Only` / `X-Update-Only` / `X-Expected-Rev` semantics as artifacts. Response carries the public URL (`/i/<name>`), content type, size, sha256 and rev |
+| POST | `/api/images/batch` | body = JSON `{"replace": false, "images": [{"name", "content" (base64), "contentType"}]}`; up to 50 images and one `ARTIFACTS_MAX_BODY` worth of bytes per call. Structural problems (bad JSON, empty or oversized array) are 400; anything specific to one image — invalid name, non-image `contentType`, existing name without `replace` — fails only that item, and the structurally valid answer is 200 with `{"uploaded", "failed", "results"}` in the request order (each row either the usual image body or `{"name", "error"}`) |
 | DELETE | `/api/images/{name}` | remove the image with all versions |
 
 ## Configuration (env)
@@ -85,7 +86,9 @@ TypeScript MCP server over stdio with tools `list_artifacts`, `get_artifact`,
 `save_artifact` (create-only), `update_artifact` (update-only), `list_versions`,
 `rollback_artifact`, `rename_artifact`, `delete_artifact`, plus the image tools
 `upload_image` / `update_image` (sources: local `filePath`, `sourceUrl` or
-`contentBase64`), `list_images`, `delete_image`. Responses include the public URL
+`contentBase64`), the batch `upload_images` (same per-item sources, per-item
+results — the alternative to N single calls when several images go into one
+page), `list_images`, `delete_image`. Responses include the public URL
 (`/a/<name>`, images `/i/<name>`) so an agent can hand the link straight to the user.
 
 Large content never passes through the model context: `get_artifact` writes the

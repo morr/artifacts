@@ -249,7 +249,7 @@ async function putImage(
   return { content: [{ type: "text" as const, text: JSON.stringify(result, null, 2) }] };
 }
 
-const server = new McpServer({ name: "artifacts", version: "0.4.0" });
+const server = new McpServer({ name: "artifacts", version: "0.5.0" });
 
 server.registerTool(
   "list_artifacts",
@@ -501,7 +501,8 @@ server.registerTool(
       "(use update_image then). Provide exactly one source: filePath (local image file), sourceUrl " +
       "(http(s) URL to download) or contentBase64 (raw bytes encoded as base64 — prefer filePath/sourceUrl " +
       'for anything large). contentType must be image/*; default: from the file extension or the source ' +
-      'response, else "image/png".',
+      'response, else "image/png". Uploading several images for one page? Use upload_images instead — ' +
+      'one call instead of N.',
     inputSchema: {
       name: z.string().describe(`Image name, ${NAME_RULE}`),
       filePath: z.string().optional().describe("Local image file to read the bytes from"),
@@ -521,7 +522,8 @@ server.registerTool(
       "Replace the bytes of an EXISTING image, keeping its public URL (<base>/i/<name>); the previous " +
       "version is archived. Fails if the image does not exist (use upload_image then). Sources are the " +
       "same as upload_image (exactly one of filePath, sourceUrl, contentBase64); contentType default: " +
-      "from the source, else the image's current type.",
+      "from the source, else the image's current type. Uploading several images for one page? Use " +
+      "upload_images instead — one call instead of N.",
     inputSchema: {
       name: z.string().describe(`Image name, ${NAME_RULE}`),
       filePath: z.string().optional().describe("Local image file to read the bytes from"),
@@ -531,6 +533,73 @@ server.registerTool(
     },
   },
   async (args) => putImage(args, "update"),
+);
+
+server.registerTool(
+  "upload_images",
+  {
+    title: "Upload images (batch)",
+    description:
+      "Upload SEVERAL new images in one call and get their public URLs (<base>/i/<name>) for embedding " +
+      "into artifacts, e.g. <img src>. The batch alternative to repeated upload_image calls: one tool " +
+      "round-trip instead of N — use it whenever more than a couple of images go into the same page. " +
+      "Fails per item, not as a whole: each result row carries either the URL or an error (e.g. a name " +
+      "that already exists), successful items still land — retry only the failed rows. Each image takes " +
+      "the same sources as upload_image (exactly one of filePath, sourceUrl, contentBase64); contentType " +
+      "defaults from the extension or the source response, else image/png. Max 50 images and 10 MB of " +
+      "total bytes per call (the request body limit) — split bigger sets into several calls.",
+    inputSchema: {
+      images: z
+        .array(
+          z.object({
+            name: z.string().describe(`Image name, ${NAME_RULE}`),
+            filePath: z.string().optional().describe("Local image file to read the bytes from"),
+            sourceUrl: z.string().optional().describe("http(s) URL to download the image from"),
+            contentBase64: z.string().optional().describe("Image bytes encoded as base64"),
+            contentType: z.string().optional().describe('MIME type, must be image/*, e.g. "image/png"; default: from the extension/source, else "image/png"'),
+          }),
+        )
+        .min(1)
+        .max(50)
+        .describe("Images to upload, in the order the result rows come back"),
+      replace: z
+        .boolean()
+        .optional()
+        .describe("Replace images that already exist (the previous version is archived); default false — an existing name is a per-item error"),
+    },
+  },
+  async ({ images, replace }) => {
+    const c = config();
+    const resolved = await Promise.all(
+      images.map(async (item) => {
+        assertName(item.name);
+        const given = [item.filePath, item.sourceUrl, item.contentBase64].filter((v) => v !== undefined).length;
+        if (given !== 1) {
+          throw new ToolError(`image "${item.name}": provide exactly one source: filePath, sourceUrl or contentBase64`);
+        }
+        const { data, typeHint } = await resolveImageSource(item);
+        const contentType = assertImageType(item.contentType ?? typeHint ?? "image/png");
+        return { name: item.name, content: data.toString("base64"), contentType };
+      }),
+    );
+    const resp = await api("/api/images/batch", {
+      ...c,
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ replace: replace ?? false, images: resolved }),
+    }).catch((e: Error) => {
+      if (/404/.test(e.message)) {
+        throw new ToolError(
+          e.message +
+            " — this artifacts server predates the batch route; deploy the updated server, " +
+            "or upload the images one by one with upload_image",
+        );
+      }
+      throw e;
+    });
+    const batch = (await resp.json()) as { uploaded: number; failed: number; results: Array<Record<string, unknown>> };
+    return { content: [{ type: "text", text: JSON.stringify(batch, null, 2) }] };
+  },
 );
 
 server.registerTool(
