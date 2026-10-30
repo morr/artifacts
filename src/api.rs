@@ -723,7 +723,10 @@ async fn put_artifact(
     let target = if create_only {
         project.clone()
     } else {
-        resolved.flatten().or_else(|| project.clone())
+        // Some(None) means "resolved to the legacy namespace" — unwrap_or_else
+        // keeps that None; flatten() would turn it into "unresolved" and fork
+        // the update into the project namespace.
+        resolved.unwrap_or_else(|| project.clone())
     };
 
     let content_type = headers
@@ -1082,7 +1085,10 @@ async fn put_image(
     let target = if create_only {
         project.clone()
     } else {
-        resolved.flatten().or_else(|| project.clone())
+        // Some(None) means "resolved to the legacy namespace" — unwrap_or_else
+        // keeps that None; flatten() would turn it into "unresolved" and fork
+        // the update into the project namespace.
+        resolved.unwrap_or_else(|| project.clone())
     };
 
     match state
@@ -1258,8 +1264,7 @@ fn batch_item_outcome(
     }
     let target = if replace {
         resolve_namespace(|p, n| state.images.exists(p, n), project, &item.name)
-            .flatten()
-            .or_else(|| project.map(str::to_string))
+            .unwrap_or_else(|| project.map(str::to_string))
     } else {
         // create-only: exactly the requested namespace
         let taken = project.is_some_and(|p| state.images.exists(Some(p), &item.name))
@@ -2443,6 +2448,126 @@ mod tests {
         )
         .await;
         assert_eq!(status, StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn legacy_artifact_update_from_project_session_stays_in_legacy() {
+        let dir = tempfile::tempdir().unwrap();
+        let app = router(test_state(dir.path()), 10 * 1024 * 1024);
+
+        // the artifact predates projects and lives in the legacy namespace
+        let (status, body, _) = send(&app, auth_put("x-plan", "<h1>v1</h1>", &[])).await;
+        assert_eq!(status, StatusCode::CREATED);
+        let created: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(created["rev"], 1);
+
+        // a project session updates it guarded by the legacy rev: the update
+        // must land in the legacy namespace — not 409 against an empty project
+        // namespace and not fork a copy into it
+        let (status, body, _) = send(
+            &app,
+            auth_put_project(
+                "minisklad",
+                "x-plan",
+                "<h1>v2</h1>",
+                &[("x-update-only", "true"), ("x-expected-rev", "1")],
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&body));
+        let updated: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(updated["project"], serde_json::Value::Null);
+        assert_eq!(updated["rev"], 2);
+        assert_eq!(updated["created"], false);
+
+        // a session read still falls back to the one updated artifact
+        let req = Request::get("/api/artifacts/x-plan")
+            .header(header::AUTHORIZATION, "Bearer secret-token")
+            .header("x-project", "minisklad")
+            .body(Body::empty())
+            .unwrap();
+        let (_, body, _) = send(&app, req).await;
+        let meta: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(meta["project"], serde_json::Value::Null);
+        assert_eq!(meta["meta"]["rev"], 2);
+
+        // the project namespace gained no copy
+        let req = Request::get("/api/artifacts?project=minisklad")
+            .header(header::AUTHORIZATION, "Bearer secret-token")
+            .body(Body::empty())
+            .unwrap();
+        let (_, body, _) = send(&app, req).await;
+        let items: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(items.as_array().unwrap().len(), 0);
+    }
+
+    #[tokio::test]
+    async fn legacy_image_update_from_project_session_stays_in_legacy() {
+        let dir = tempfile::tempdir().unwrap();
+        let app = router(test_state(dir.path()), 10 * 1024 * 1024);
+
+        let (status, _, _) = send(
+            &app,
+            auth_put_image("x-shot", "image/png", b"v1".to_vec(), &[]),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CREATED);
+
+        // the guarded single-image update resolves to the legacy namespace
+        let (status, body, _) = send(
+            &app,
+            auth_put_image(
+                "x-shot",
+                "image/png",
+                b"v2".to_vec(),
+                &[
+                    ("x-project", "minisklad"),
+                    ("x-update-only", "true"),
+                    ("x-expected-rev", "1"),
+                ],
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&body));
+        let updated: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(updated["project"], serde_json::Value::Null);
+        assert_eq!(updated["rev"], 2);
+
+        // batch replace resolves the same way
+        let batch = serde_json::json!({
+            "replace": true,
+            "project": "minisklad",
+            "images": [
+                { "name": "x-shot", "content": base64::engine::general_purpose::STANDARD.encode(b"v3"), "contentType": "image/png" },
+            ],
+        });
+        let req = Request::post("/api/images/batch")
+            .header(header::AUTHORIZATION, "Bearer secret-token")
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(serde_json::to_vec(&batch).unwrap()))
+            .unwrap();
+        let (status, body, _) = send(&app, req).await;
+        assert_eq!(status, StatusCode::OK);
+        let batch: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(batch["uploaded"], 1);
+        assert_eq!(batch["results"][0]["project"], serde_json::Value::Null);
+
+        // the legacy image carries the batch content; the project namespace
+        // gained no copy
+        let (status, body, _) = send(
+            &app,
+            Request::get("/i/x-shot").body(Body::empty()).unwrap(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body, b"v3");
+        let req = Request::get("/api/images?project=minisklad")
+            .header(header::AUTHORIZATION, "Bearer secret-token")
+            .body(Body::empty())
+            .unwrap();
+        let (_, body, _) = send(&app, req).await;
+        let items: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(items.as_array().unwrap().len(), 0);
     }
 
     #[tokio::test]
